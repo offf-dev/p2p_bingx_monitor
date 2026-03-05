@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "BingX P2P Monitor",
+  "version": "1.0",
+  "description": "Monitors BingX P2P sell offers for USDT in THB",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://fiat.bingx.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_end"
+    }
+  ]
+}

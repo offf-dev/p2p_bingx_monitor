@@ -1,0 +1,105 @@
+#bingx-monitor-panel {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    background: #f8f8f8;
+    border-bottom: 1px solid #ccc;
+    padding: 8px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 10000;
+    font-family: Arial, sans-serif;
+    font-size: 14px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    box-sizing: border-box;
+    transition: transform 0.3s ease;
+}
+#bingx-monitor-panel.collapsed {
+    transform: translateY(-100%);
+}
+#bingx-monitor-panel .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+#bingx-monitor-panel button {
+    padding: 6px 12px;
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+#bingx-monitor-panel button:hover {
+    background-color: #45a049;
+}
+#bingx-monitor-panel button:disabled {
+    background-color: #cccccc;
+    cursor: not-allowed;
+}
+#bingx-monitor-panel button#resetStorage {
+    background-color: #f44336;
+}
+#bingx-monitor-panel button#resetStorage:hover {
+    background-color: #d32f2f;
+}
+#bingx-monitor-panel input {
+    width: 120px;
+    padding: 6px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+#bingx-monitor-panel input#ignoredMerchants {
+    width: 120px;
+    padding: 6px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+#bingx-monitor-panel .status {
+    color: #333;
+}
+#bingx-monitor-panel .error {
+    color: red;
+}
+#toggle-panel {
+    padding: 6px;
+    background-color: #2196F3;
+    width: 30px;
+    position: absolute;
+    top: 10px;
+    right: 15px;
+}
+#toggle-panel:hover {
+    background-color: #1976D2;
+}
+#toggle-button-container {
+    position: fixed;
+    top: 0;
+    right: 16px;
+    z-index: 10001;
+}
+#toggle-button-container button {
+    padding: 6px;
+    background-color: #2196F3;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+#toggle-button-container button:hover {
+    background-color: #1976D2;
+}
+#alertMessages {
+    color: red;
+    max-width: 400px;
+    opacity: 1;
+    transition: opacity 0.5s ease-out;
+}
+#alertMessages.fade-out {
+    opacity: 0;
+}
+.table-cell.text-right span.btn {
+    display: none !important;
+}
