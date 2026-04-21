@@ -1,27 +1,182 @@
+let monitoringIntervalId = null;
+let audioCtx = null;
+let lastBeepedMinPrice = null;
+let lastPriceBelowBeepAt = 0;
+let missingRowCount = 0;
+
+const PRICE_BELOW_BEEP_INTERVAL_MS = 30000;
+
 function removeEmojis(text) {
     return text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\u{200D}\u{FE0F}]/gu, '').trim();
 }
 
 function showMessage(message) {
     const alertMessages = document.getElementById('alertMessages');
-    if (alertMessages) {
-        alertMessages.textContent = message;
-        alertMessages.classList.remove('fade-out');
+    if (!alertMessages) return;
+    alertMessages.textContent = message;
+    alertMessages.classList.remove('fade-out');
+    setTimeout(() => {
+        alertMessages.classList.add('fade-out');
         setTimeout(() => {
-            alertMessages.classList.add('fade-out');
-            setTimeout(() => {
-                alertMessages.textContent = '';
-                alertMessages.classList.remove('fade-out');
-            }, 500);
-        }, 5000);
+            alertMessages.textContent = '';
+            alertMessages.classList.remove('fade-out');
+        }, 500);
+    }, 5000);
+}
+
+function ensureAudioContext() {
+    if (!audioCtx) {
+        try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (error) {
+            console.error('Error creating AudioContext:', error);
+            return null;
+        }
+    }
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(err => console.error('Resume error:', err));
+    }
+    return audioCtx;
+}
+
+function playBeep() {
+    const ctx = ensureAudioContext();
+    if (!ctx) return;
+    try {
+        const oscillator = ctx.createOscillator();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
+        oscillator.connect(ctx.destination);
+        oscillator.start();
+        oscillator.stop(ctx.currentTime + 0.3);
+    } catch (error) {
+        console.error('Error playing beep:', error);
+    }
+}
+
+function checkSelectors() {
+    const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
+    const priceElements = document.querySelectorAll('.number.line-height20.text1.weight-bolder.font18');
+    const limitElements = document.querySelectorAll('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
+    console.log('Rows:', rows.length, 'Prices:', priceElements.length, 'Limits:', limitElements.length);
+    return rows.length > 0 && priceElements.length > 0 && limitElements.length > 0;
+}
+
+function performCycle() {
+    chrome.storage.local.get(['userPrice', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit'], (data) => {
+        if (!data.isMonitoring) {
+            stopMonitoring();
+            return;
+        }
+
+        const userPrice = data.userPrice;
+        const merchantName = data.merchantName;
+        const ignoredMerchants = data.ignoredMerchants
+            ? data.ignoredMerchants.split(',').map(name => removeEmojis(name.trim())).filter(Boolean)
+            : [];
+
+        try {
+            const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
+            let minPrice = Infinity;
+            let foundOwnRow = false;
+            let currentLimit = null;
+
+            rows.forEach((row) => {
+                const nameEl = row.querySelector('.cursor-pointer.ellipsis.weight-bolder');
+                const priceEl = row.querySelector('.number.line-height20.text1.weight-bolder.font18');
+                const limitEl = row.querySelector('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
+
+                if (priceEl && userPrice) {
+                    const cleanName = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
+                    if (!ignoredMerchants.includes(cleanName)) {
+                        const priceText = priceEl.textContent.replace(' THB', '').trim();
+                        const price = parseFloat(priceText);
+                        if (!isNaN(price) && price < minPrice) minPrice = price;
+                    }
+                }
+
+                if (nameEl && limitEl && merchantName) {
+                    const cleanName = removeEmojis(nameEl.textContent.trim());
+                    const cleanInputName = removeEmojis(merchantName);
+                    if (cleanName.includes(cleanInputName)) {
+                        foundOwnRow = true;
+                        const limitText = limitEl.textContent.replace(' USDT', '').replace(/,/g, '').trim();
+                        const parsed = parseFloat(limitText);
+                        if (!isNaN(parsed)) currentLimit = parsed;
+                    }
+                }
+            });
+
+            // Цены конкурентов: сигналим при изменении минимальной цены + напоминание каждые 30 сек, пока она ниже нашей
+            if (userPrice && minPrice < userPrice) {
+                const now = Date.now();
+                const priceChanged = lastBeepedMinPrice !== minPrice;
+                const timeToRemind = now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS;
+                if (priceChanged || timeToRemind) {
+                    playBeep();
+                    showMessage(`Найдена цена ниже вашей: ${minPrice} THB!`);
+                    lastBeepedMinPrice = minPrice;
+                    lastPriceBelowBeepAt = now;
+                }
+            } else {
+                lastBeepedMinPrice = null;
+                lastPriceBelowBeepAt = 0;
+            }
+
+            // Свой ряд и изменение лимита
+            const errorEl = document.getElementById('error');
+            if (merchantName) {
+                if (foundOwnRow) {
+                    missingRowCount = 0;
+                    if (errorEl) errorEl.textContent = '';
+                    const previousLimit = data.previousLimit;
+                    if (currentLimit !== null && typeof previousLimit === 'number' && currentLimit !== previousLimit) {
+                        playBeep();
+                        showMessage(`Лимит изменился! Новый: ${currentLimit} USDT (предыдущий: ${previousLimit} USDT)`);
+                    }
+                    if (currentLimit !== null) {
+                        chrome.storage.local.set({ previousLimit: currentLimit });
+                    }
+                } else {
+                    missingRowCount++;
+                    if (errorEl) errorEl.textContent = 'Ваш ряд не найден!';
+                    // Сигналим только если ряд отсутствует 2 цикла подряд и раньше он точно был
+                    if (missingRowCount >= 2 && typeof data.previousLimit === 'number') {
+                        playBeep();
+                        showMessage('Ваш ряд исчез! USDT выкуплены?');
+                        chrome.storage.local.set({ previousLimit: null });
+                        missingRowCount = 0;
+                    }
+                }
+            }
+
+            console.log('Cycle. minPrice:', minPrice, 'userPrice:', userPrice, 'currentLimit:', currentLimit, 'previousLimit:', data.previousLimit, 'missing:', missingRowCount);
+        } catch (error) {
+            console.error('Error in monitoring cycle:', error);
+        }
+    });
+}
+
+function startMonitoring() {
+    stopMonitoring();
+    lastBeepedMinPrice = null;
+    lastPriceBelowBeepAt = 0;
+    missingRowCount = 0;
+    performCycle();
+    monitoringIntervalId = setInterval(performCycle, 10000);
+    console.log('Monitoring started');
+}
+
+function stopMonitoring() {
+    if (monitoringIntervalId) {
+        clearInterval(monitoringIntervalId);
+        monitoringIntervalId = null;
+        console.log('Monitoring interval cleared');
     }
 }
 
 function createPanel() {
-    if (document.getElementById('bingx-monitor-panel')) {
-        console.log('Panel already exists');
-        return;
-    }
+    if (document.getElementById('bingx-monitor-panel')) return;
 
     try {
         const panel = document.createElement('div');
@@ -51,34 +206,34 @@ function createPanel() {
         const toggleButtonContainer = document.createElement('div');
         toggleButtonContainer.id = 'toggle-button-container';
         document.body.prepend(toggleButtonContainer);
-        console.log('Panel and toggle button container created successfully');
 
-        // Загрузка сохранённых данных
-        chrome.storage.local.get(['merchantName', 'userPrice', 'ignoredMerchants', 'isPanelCollapsed'], (data) => {
-            if (data.merchantName) {
-                document.getElementById('merchantName').value = data.merchantName;
+        chrome.storage.local.get(
+            ['merchantName', 'userPrice', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring'],
+            (data) => {
+                if (data.merchantName) document.getElementById('merchantName').value = data.merchantName;
+                if (data.userPrice) document.getElementById('userPrice').value = data.userPrice;
+                if (data.ignoredMerchants) document.getElementById('ignoredMerchants').value = data.ignoredMerchants;
+                if (data.isPanelCollapsed) {
+                    panel.classList.add('collapsed');
+                    const toggleButton = document.getElementById('toggle-panel');
+                    toggleButton.textContent = '↓';
+                    toggleButtonContainer.appendChild(toggleButton);
+                }
+                // Восстановление активного мониторинга после перезагрузки страницы / пересоздания панели
+                if (data.isMonitoring) {
+                    document.getElementById('startMonitoring').disabled = true;
+                    document.getElementById('stopMonitoring').disabled = false;
+                    document.getElementById('status').textContent = 'Мониторинг запущен...';
+                    if (!monitoringIntervalId) startMonitoring();
+                }
             }
-            if (data.userPrice) {
-                document.getElementById('userPrice').value = data.userPrice;
-            }
-            if (data.ignoredMerchants) {
-                document.getElementById('ignoredMerchants').value = data.ignoredMerchants;
-            }
-            if (data.isPanelCollapsed) {
-                panel.classList.add('collapsed');
-                const toggleButton = document.getElementById('toggle-panel');
-                toggleButton.textContent = '↓';
-                toggleButtonContainer.appendChild(toggleButton);
-            }
-        });
+        );
 
-        // Сохранение имени мерчанта
         document.getElementById('merchantName').addEventListener('input', () => {
             const merchantName = document.getElementById('merchantName').value.trim();
             chrome.storage.local.set({ merchantName });
         });
 
-        // Сохранение цены
         document.getElementById('userPrice').addEventListener('input', () => {
             const userPrice = parseFloat(document.getElementById('userPrice').value);
             if (!isNaN(userPrice) && userPrice > 0) {
@@ -86,28 +241,24 @@ function createPanel() {
             }
         });
 
-        // Сохранение игнорируемых мерчантов
         document.getElementById('ignoredMerchants').addEventListener('input', () => {
             const ignoredMerchants = document.getElementById('ignoredMerchants').value.trim();
             chrome.storage.local.set({ ignoredMerchants });
         });
 
-        // Проверка селекторов
         document.getElementById('checkSelectors').addEventListener('click', () => {
             const result = checkSelectors();
             if (result) {
                 document.getElementById('status').textContent = 'Селекторы найдены!';
                 document.getElementById('error').textContent = '';
-                console.log('Selectors found');
             } else {
                 document.getElementById('error').textContent = 'Селекторы не найдены!';
                 document.getElementById('status').textContent = '';
-                console.log('Selectors not found');
             }
         });
 
-        // Сброс данных
         document.getElementById('resetStorage').addEventListener('click', () => {
+            stopMonitoring();
             chrome.storage.local.clear(() => {
                 document.getElementById('userPrice').value = '';
                 document.getElementById('ignoredMerchants').value = '';
@@ -116,221 +267,61 @@ function createPanel() {
                 document.getElementById('error').textContent = '';
                 document.getElementById('startMonitoring').disabled = false;
                 document.getElementById('stopMonitoring').disabled = true;
-                console.log('Storage cleared');
             });
         });
 
-        // Мониторинг
         document.getElementById('startMonitoring').addEventListener('click', () => {
             const userPrice = parseFloat(document.getElementById('userPrice').value);
             const merchantName = document.getElementById('merchantName').value.trim();
             if (!userPrice && !merchantName) {
                 document.getElementById('error').textContent = 'Введите хотя бы цену или имя мерчанта!';
-                console.log('Invalid input: both price and merchant name are empty');
                 return;
             }
             if (userPrice && (isNaN(userPrice) || userPrice <= 0)) {
                 document.getElementById('error').textContent = 'Введите корректную цену!';
-                console.log('Invalid price entered');
                 return;
             }
+            // Инициализируем AudioContext на пользовательском жесте, иначе звук будет заблокирован
+            ensureAudioContext();
             chrome.storage.local.set({ userPrice, merchantName, isMonitoring: true }, () => {
-                startAutoSwitchMonitoring();
+                startMonitoring();
                 document.getElementById('status').textContent = 'Мониторинг запущен...';
                 document.getElementById('error').textContent = '';
                 document.getElementById('startMonitoring').disabled = true;
                 document.getElementById('stopMonitoring').disabled = false;
-                console.log('Monitoring started with price:', userPrice, 'merchant:', merchantName);
             });
         });
 
         document.getElementById('stopMonitoring').addEventListener('click', () => {
             chrome.storage.local.set({ isMonitoring: false, previousLimit: null }, () => {
+                stopMonitoring();
                 document.getElementById('status').textContent = 'Мониторинг остановлен.';
                 document.getElementById('startMonitoring').disabled = false;
                 document.getElementById('stopMonitoring').disabled = true;
-                console.log('Monitoring stopped');
             });
         });
 
-        // Сворачивание/разворачивание панели
         document.getElementById('toggle-panel').addEventListener('click', () => {
-            const panel = document.getElementById('bingx-monitor-panel');
+            const panelEl = document.getElementById('bingx-monitor-panel');
             const toggleButton = document.getElementById('toggle-panel');
-            const toggleButtonContainer = document.getElementById('toggle-button-container');
-            const isCollapsed = panel.classList.toggle('collapsed');
+            const container = document.getElementById('toggle-button-container');
+            const isCollapsed = panelEl.classList.toggle('collapsed');
 
             if (isCollapsed) {
                 toggleButton.textContent = '↓';
-                toggleButtonContainer.appendChild(toggleButton);
+                container.appendChild(toggleButton);
             } else {
                 toggleButton.textContent = '↑';
-                panel.appendChild(toggleButton);
+                panelEl.appendChild(toggleButton);
             }
 
             chrome.storage.local.set({ isPanelCollapsed: isCollapsed });
-            console.log('Panel toggled, collapsed:', isCollapsed);
         });
     } catch (error) {
         console.error('Error creating panel:', error);
     }
 }
 
-function checkSelectors() {
-    const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
-    const priceElements = document.querySelectorAll('.number.line-height20.text1.weight-bolder.font18');
-    const limitElements = document.querySelectorAll('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
-    const buySellButtons = document.querySelectorAll('.bx-segmented-item .bx-segmented-label');
-    console.log('Rows found:', rows.length, 'Price elements found:', priceElements.length, 'Limit elements found:', limitElements.length, 'Buy/Sell buttons found:', buySellButtons.length);
-    return rows.length > 0 && priceElements.length > 0 && limitElements.length > 0 && buySellButtons.length >= 2;
-}
-
-function playBeep() {
-    try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const oscillator = ctx.createOscillator();
-        oscillator.type = 'sine';
-        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
-        oscillator.connect(ctx.destination);
-        oscillator.start();
-        oscillator.stop(ctx.currentTime + 0.3);
-        console.log('Beep played');
-    } catch (error) {
-        console.error('Error playing beep:', error);
-    }
-}
-
-async function switchToSell() {
-    const buttons = document.querySelectorAll('.bx-segmented-item .bx-segmented-label');
-    for (const button of buttons) {
-        if (button.textContent.trim() === 'Продать') {
-            button.click();
-            console.log('Switched to Sell');
-            return true;
-        }
-    }
-    console.log('Sell button not found');
-    document.getElementById('error').textContent = 'Кнопка "Продать" не найдена!';
-    return false;
-}
-
-async function switchToBuy() {
-    const buttons = document.querySelectorAll('.bx-segmented-item .bx-segmented-label');
-    for (const button of buttons) {
-        if (button.textContent.trim() === 'Купить') {
-            button.click();
-            console.log('Switched to Buy');
-            return true;
-        }
-    }
-    console.log('Buy button not found');
-    document.getElementById('error').textContent = 'Кнопка "Купить" не найдена!';
-    return false;
-}
-
-function startAutoSwitchMonitoring() {
-    chrome.storage.local.get(['userPrice', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit'], async (data) => {
-        const userPrice = data.userPrice;
-        const merchantName = data.merchantName;
-        const ignoredMerchants = data.ignoredMerchants ? data.ignoredMerchants.split(',').map(name => removeEmojis(name.trim())).filter(name => name) : [];
-        if (!data.isMonitoring) {
-            console.log('Monitoring not started: isMonitoring is false');
-            return;
-        }
-
-        let intervalId = null;
-
-        const performCycle = async () => {
-            chrome.storage.local.get(['isMonitoring', 'previousLimit'], async (storageData) => {
-                if (!storageData.isMonitoring) {
-                    console.log('Monitoring stopped');
-                    if (intervalId) clearInterval(intervalId);
-                    return;
-                }
-
-                try {
-                    // Переключение на "Продать"
-                    const sellSuccess = await switchToSell();
-                    if (!sellSuccess) return;
-                    await new Promise(resolve => setTimeout(resolve, 3000)); // Ждать 3 секунды
-
-                    // Переключение на "Купить"
-                    const buySuccess = await switchToBuy();
-                    if (!buySuccess) return;
-                    await new Promise(resolve => setTimeout(resolve, 3000)); // Ждать 3 секунды
-
-                    // Проверка таблицы на вкладке "Купить"
-                    const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
-                    let minPrice = Infinity;
-                    let foundOwnRow = false;
-                    let currentLimit = null;
-
-                    rows.forEach((row) => {
-                        const nameEl = row.querySelector('.cursor-pointer.ellipsis.weight-bolder');
-                        const priceEl = row.querySelector('.number.line-height20.text1.weight-bolder.font18');
-                        const limitEl = row.querySelector('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
-
-                        if (priceEl && userPrice) {
-                            const cleanName = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
-                            if (!ignoredMerchants.includes(cleanName)) {
-                                const priceText = priceEl.textContent.replace(' THB', '').trim();
-                                const price = parseFloat(priceText);
-                                if (!isNaN(price) && price < minPrice) minPrice = price;
-                            }
-                        }
-
-                        if (nameEl && limitEl && merchantName) {
-                            const cleanName = removeEmojis(nameEl.textContent.trim());
-                            const cleanInputName = removeEmojis(merchantName);
-                            if (cleanName.includes(cleanInputName)) {
-                                foundOwnRow = true;
-                                const limitText = limitEl.textContent.replace(' USDT', '').replace(',', '').trim();
-                                currentLimit = parseFloat(limitText);
-                            }
-                        }
-                    });
-
-                    // Проверка цен
-                    if (userPrice && minPrice < userPrice) {
-                        playBeep();
-                        showMessage(`Найдена цена ниже вашей: ${minPrice} THB!`);
-                    }
-
-                    // Проверка лимита
-                    if (merchantName) {
-                        if (foundOwnRow) {
-                            const previousLimit = storageData.previousLimit;
-                            if (previousLimit !== null && currentLimit !== previousLimit) {
-                                playBeep();
-                                showMessage(`Лимит изменился! Новый: ${currentLimit} USDT (предыдущий: ${previousLimit} USDT)`);
-                            }
-                            chrome.storage.local.set({ previousLimit: currentLimit });
-                            document.getElementById('error').textContent = '';
-                        } else {
-                            document.getElementById('error').textContent = 'Ваш ряд не найден!';
-                            console.log('Own row not found for merchant:', merchantName);
-                            // Сигнал, если ряд исчез (был ранее, но теперь не найден)
-                            if (storageData.previousLimit !== null) {
-                                playBeep();
-                                showMessage('Ваш ряд исчез! USDT выкуплены?');
-                                chrome.storage.local.set({ previousLimit: null }); // Сброс, чтобы не сигнализировать повторно
-                            }
-                        }
-                    }
-
-                    console.log('Auto-switch mode - Checked prices, min price:', minPrice, 'User price:', userPrice, 'Current limit:', currentLimit, 'Previous limit:', storageData.previousLimit, 'Ignored merchants:', ignoredMerchants);
-                } catch (error) {
-                    console.error('Error in auto-switch monitoring:', error);
-                }
-            });
-        };
-
-        performCycle();
-        intervalId = setInterval(performCycle, 10000);
-    });
-}
-
-// Запуск создания панели с наблюдателем за DOM
 function init() {
     try {
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
@@ -341,7 +332,6 @@ function init() {
 
         const observer = new MutationObserver(() => {
             if (!document.getElementById('bingx-monitor-panel') && document.querySelector('.p2p-adverts-table')) {
-                console.log('Table detected, creating panel');
                 createPanel();
             }
         });
