@@ -103,3 +103,141 @@
 .table-cell.text-right span.btn {
     display: none !important;
 }
+
+#bingx-monitor-panel .alert-row {
+    border-top: 2px solid #f44336;
+    padding-top: 8px;
+    background: #fff4f4;
+    margin: 0 -16px -8px -16px;
+    padding-left: 16px;
+    padding-right: 16px;
+    padding-bottom: 8px;
+}
+#bingx-monitor-panel .alert-row .alert-label {
+    font-weight: bold;
+    color: #c62828;
+}
+#bingx-monitor-panel .alert-row label {
+    white-space: nowrap;
+}
+#bingx-monitor-panel .alert-row input[type="number"] {
+    width: 110px;
+}
+#bingx-monitor-panel .alert-row input[type="text"] {
+    width: 180px;
+}
+#bingx-monitor-panel button#applyPriceChange {
+    background-color: #f44336;
+}
+#bingx-monitor-panel button#applyPriceChange:hover {
+    background-color: #d32f2f;
+}
+#bingx-monitor-panel button#closeAlert {
+    background-color: #9e9e9e;
+}
+
+#bingx-auto-overlay {
+    position: fixed;
+    top: 80px;
+    right: 20px;
+    width: 460px;
+    max-height: 80vh;
+    overflow-y: auto;
+    word-break: break-word;
+    background: #fff;
+    border: 1px solid #2196F3;
+    border-radius: 6px;
+    padding: 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    z-index: 10002;
+    font-family: Arial, sans-serif;
+    font-size: 13px;
+    color: #222;
+}
+#bingx-auto-overlay.error {
+    border-color: #f44336;
+    background: #fff6f6;
+}
+#bingx-auto-overlay .bingx-auto-title {
+    font-weight: bold;
+    margin-bottom: 6px;
+    color: #1976D2;
+}
+#bingx-auto-overlay.error .bingx-auto-title {
+    color: #c62828;
+}
+#bingx-auto-overlay .bingx-auto-status {
+    margin-bottom: 8px;
+    line-height: 1.4;
+}
+#bingx-auto-overlay .bingx-auto-info {
+    background: #f0f7ff;
+    border-left: 3px solid #1976D2;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #222;
+}
+#bingx-monitor-panel .autonomous-label {
+    white-space: nowrap;
+    cursor: pointer;
+}
+#bingx-monitor-panel .autonomous-label input[type="checkbox"] {
+    width: auto;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+#bingx-auto-overlay button#bingx-auto-cancel {
+    padding: 6px 12px;
+    background: #f44336;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+#bingx-auto-overlay button#bingx-auto-cancel:hover {
+    background: #d32f2f;
+}
+
+#bingx-countdown-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 10003;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Arial, sans-serif;
+}
+#bingx-countdown-overlay .countdown-box {
+    background: #fff;
+    border-radius: 8px;
+    padding: 24px 32px;
+    text-align: center;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+#bingx-countdown-overlay .countdown-title {
+    font-size: 15px;
+    color: #333;
+    margin-bottom: 12px;
+}
+#bingx-countdown-overlay .countdown-seconds {
+    font-size: 64px;
+    font-weight: bold;
+    color: #1976D2;
+    margin-bottom: 16px;
+    line-height: 1;
+}
+#bingx-countdown-overlay button#bingx-countdown-cancel {
+    padding: 8px 20px;
+    background: #f44336;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+}
+#bingx-countdown-overlay button#bingx-countdown-cancel:hover {
+    background: #d32f2f;
+}

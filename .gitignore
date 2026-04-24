@@ -34,5 +34,8 @@ docker/redis
 # Tests
 .phpunit.result.cache
 
+# Temp
+/temp
+
 # Misc
 *.log
