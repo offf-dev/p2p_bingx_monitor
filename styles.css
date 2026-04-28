@@ -188,6 +188,29 @@
     margin-right: 4px;
     vertical-align: middle;
 }
+#bingx-monitor-panel .autonomous-label input[type="checkbox"]:disabled {
+    cursor: not-allowed;
+}
+
+#bingx-monitor-panel .telegram-row {
+    background: #eef5fb;
+    margin: 0 -16px -8px -16px;
+    padding: 6px 16px;
+    border-top: 1px solid #cfe2f3;
+}
+#bingx-monitor-panel .telegram-row input[type="text"],
+#bingx-monitor-panel .telegram-row input[type="password"] {
+    width: 240px;
+}
+#bingx-monitor-panel button#testTelegram {
+    background-color: #0088cc;
+}
+#bingx-monitor-panel button#testTelegram:hover {
+    background-color: #006699;
+}
+#bingx-monitor-panel .telegram-row #telegramStatus {
+    font-size: 12px;
+}
 #bingx-auto-overlay button#bingx-auto-cancel {
     padding: 6px 12px;
     background: #f44336;

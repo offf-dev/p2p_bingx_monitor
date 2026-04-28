@@ -8,6 +8,7 @@ let autoOverlayEl = null;
 let autoFlowRunning = false;
 let alertPanelShown = false;
 let alertPanelDismissed = false;
+let tgMainPollCtx = null; // { aborted: bool }
 
 // ===== Constants =====
 const PRICE_BELOW_BEEP_INTERVAL_MS = 30000;
@@ -235,6 +236,69 @@ async function waitForPriceInput(timeoutMs) {
     throw new Error('Не найден input цены (THB-поле с диапазоном в placeholder)');
 }
 
+// ===== Telegram =====
+async function tgGetConfig() {
+    const d = await getStorage(['telegramToken', 'telegramChatId', 'notAtHome', 'autonomousMode']);
+    const enabled = !!(d.notAtHome && d.autonomousMode && d.telegramToken && d.telegramChatId);
+    return { token: d.telegramToken, chatId: d.telegramChatId, enabled };
+}
+
+async function tgSend(text) {
+    const { token, chatId, enabled } = await tgGetConfig();
+    if (!enabled) return false;
+    try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
+        });
+        const json = await res.json();
+        if (!json.ok) console.warn('TG sendMessage not ok:', json);
+        return json.ok;
+    } catch (e) {
+        console.error('TG send:', e);
+        return false;
+    }
+}
+
+// Принудительная отправка с конкретным конфигом (для кнопки "Тест").
+async function tgSendWith(token, chatId, text) {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text })
+    });
+    return res.json();
+}
+
+// Long-poll Telegram для сообщений от нашего chat. timeoutSec — параметр Telegram long-poll (до 50 сек).
+async function tgPollUpdates(token, offset, timeoutSec) {
+    const offsetInt = Number.isInteger(offset) ? offset : 0;
+    const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${offsetInt}&timeout=${timeoutSec}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (!json.ok) {
+        const err = new Error('TG getUpdates: ' + JSON.stringify(json));
+        err.errorCode = json.error_code;
+        err.description = json.description || '';
+        throw err;
+    }
+    return json.result;
+}
+
+// Если бот был настроен на webhook, getUpdates не работает. Снимаем webhook.
+async function tgDeleteWebhook(token) {
+    try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/deleteWebhook`, { method: 'POST' });
+        const json = await res.json();
+        console.log('[bingx-monitor] deleteWebhook:', json);
+        return json.ok;
+    } catch (e) {
+        console.error('deleteWebhook failed:', e);
+        return false;
+    }
+}
+
 // ===== Auto overlay (on edit page during flow) =====
 function ensureAutoOverlay() {
     if (!autoOverlayEl || !document.body.contains(autoOverlayEl)) {
@@ -391,6 +455,7 @@ async function triggerAutonomousEdit(minPrice, minPriceStr, oldPrice, orderNo) {
         }
     });
     showMessage(`Автоном: ${oldPrice} → ${target} (конкурент ${minPrice}). Переход...`);
+    tgSend(`⚠ Перебили. Конкурент: ${minPrice} THB. Ваша: ${oldPrice} THB. Меняю на ${target} THB.`).catch(() => {});
     await sleep(300);
     window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(orderNo)}`;
 }
@@ -523,6 +588,7 @@ function startMonitoring() {
     alertPanelDismissed = false;
     performCycle();
     monitoringIntervalId = setInterval(performCycle, 10000);
+    startTgMainPoll().catch(e => console.error('TG main poll start:', e));
 }
 
 function stopMonitoring() {
@@ -531,6 +597,7 @@ function stopMonitoring() {
         monitoringIntervalId = null;
     }
     hideAlertPanel();
+    stopTgMainPoll();
 }
 
 // ===== Edit page flow =====
@@ -598,21 +665,385 @@ async function runEditPageFlow(params) {
             status: 'Введите код Google Authenticator. Мониторинг возобновится автоматически после успеха.',
             competitor, oldPrice, target
         });
-        await waitForSelectorGone('.security-verify-entry', TWOFA_WAIT_TIMEOUT_MS);
+
+        const tgCfg = await tgGetConfig();
+        if (tgCfg.enabled) {
+            const lines = ['⏸ Дошёл до 2FA.'];
+            if (competitor != null) lines.push(`Конкурент: ${competitor} THB`);
+            if (oldPrice != null) lines.push(`Ваша: ${oldPrice} THB`);
+            if (target != null) lines.push(`Новая: ${target} THB`);
+            lines.push('', 'Пришли 6 цифр 2FA (или /cancel).');
+            await tgSend(lines.join('\n'));
+        }
+
+        const outcome = await wait2FA(tgCfg, TWOFA_WAIT_TIMEOUT_MS);
+        if (outcome === 'cancel') {
+            // Soft cancel — цена не сохранена, но возвращаемся на главную и продолжаем мониторинг.
+            // Уведомление в TG уже отправлено из wait2FA одним сообщением.
+            await setAutoState({ state: 'cooldown' });
+            updateAutoOverlayStatus('Отменено. Возврат на главную...');
+            await sleep(COOLDOWN_MS);
+            window.location.href = P2P_MAIN_URL;
+            return;
+        }
+        if (outcome === 'timeout') {
+            // Soft recovery: вместо мёртвого аборта возвращаемся на главную, мониторинг + поллинг продолжатся.
+            if (tgCfg.enabled) {
+                await tgSend('⏱ Таймаут 2FA. Возвращаюсь на главную, мониторинг продолжается. /change <цена> — ручная смена.').catch(() => {});
+            }
+            await setAutoState({ state: 'cooldown' });
+            updateAutoOverlayStatus('Таймаут 2FA. Возврат на главную...');
+            await sleep(COOLDOWN_MS);
+            window.location.href = P2P_MAIN_URL;
+            return;
+        }
 
         await setStorage({ userPrice: target });
         await setAutoState({ state: 'cooldown', target });
         updateAutoOverlayStatus('Сохранено. Возврат на главную...');
+        if (tgCfg.enabled) {
+            await tgSend(`✅ Обновлено: ${target} THB.`).catch(() => {});
+        }
         await sleep(COOLDOWN_MS);
         window.location.href = P2P_MAIN_URL;
     } catch (err) {
         console.error('Edit flow:', err);
-        await setStorage({ autoUpdate: { state: 'aborted', reason: err.message || String(err) } });
-        renderAutoOverlay(`Ошибка: ${err.message || err}`, { showCancel: true, isError: true });
+        const msg = err.message || String(err);
+        await setStorage({ autoUpdate: { state: 'aborted', reason: msg } });
+        renderAutoOverlay(`Ошибка: ${msg}`, { showCancel: true, isError: true });
         playBeep();
+        const cfg = await tgGetConfig();
+        if (cfg.enabled) {
+            await tgSend(`❌ Ошибка авто-обновления: ${msg}\n\nКоманды: /cancel — вернуть на главную и продолжить мониторинг, /change <цена> — попытка с другой ценой, /status.`).catch(() => {});
+            // Recovery-поллер: позволяет удалённо разблокировать стак-стейт.
+            runTgRecoveryLoop(cfg).catch(e => console.error('recovery loop:', e));
+        }
     } finally {
         autoFlowRunning = false;
     }
+}
+
+// Ждём закрытия 2FA-модалки. Если конфиг Telegram включён — параллельно поллим Telegram:
+// на сообщение с 6 цифрами вставляем код в BingX и кликаем Submit.
+// Возвращает: 'done' | 'cancel' | 'timeout'.
+async function wait2FA(tgCfg, timeoutMs) {
+    const start = Date.now();
+    const MODAL_SEL = '.security-verify-entry';
+    const CODE_INPUT_SEL = '.tl-input-inner';
+    const SUBMIT_SEL = '.submit-btn';
+
+    let offset = 0;
+    if (tgCfg.enabled) {
+        // На всякий случай снимаем webhook (если был настроен — getUpdates молча ломается).
+        await tgDeleteWebhook(tgCfg.token);
+        // Синхронизируем offset с хранилищем + пропускаем все старые апдейты.
+        const { tgLastOffset } = await getStorage(['tgLastOffset']);
+        offset = tgLastOffset || 0;
+        try {
+            const stale = await tgPollUpdates(tgCfg.token, offset, 0);
+            console.log('[bingx-monitor] wait2FA stale updates:', stale.length, 'offset=', offset);
+            if (stale.length) {
+                offset = stale[stale.length - 1].update_id + 1;
+                await setStorage({ tgLastOffset: offset });
+            }
+        } catch (e) {
+            console.error('wait2FA stale drain error:', e);
+            await tgSend(`⚠ getUpdates ошибка: ${e.description || e.message || e}`).catch(() => {});
+        }
+    }
+
+    while (Date.now() - start < timeoutMs) {
+        // (a) модалка исчезла — пользователь ввёл код вручную (VNC и т.п.)
+        if (!document.querySelector(MODAL_SEL)) return 'done';
+
+        if (tgCfg.enabled) {
+            try {
+                const updates = await tgPollUpdates(tgCfg.token, offset, 15);
+                if (updates.length) console.log('[bingx-monitor] wait2FA got', updates.length, 'updates');
+                for (const u of updates) {
+                    offset = u.update_id + 1;
+                    const msg = u.message;
+                    if (!msg || !msg.chat) continue;
+                    if (String(msg.chat.id) !== String(tgCfg.chatId)) {
+                        console.log('[bingx-monitor] skipping msg from chat', msg.chat.id, 'expected', tgCfg.chatId);
+                        continue;
+                    }
+                    const rawText = (msg.text || '').trim();
+                    const text = rawText.replace(/\s+/g, ''); // убираем пробелы внутри (напр. "123 456")
+                    console.log('[bingx-monitor] TG reply:', JSON.stringify(rawText));
+                    if (/^\/?cancel$/i.test(text)) {
+                        await setStorage({ tgLastOffset: offset });
+                        await tgSend('❌ Отменено, слежу дальше.');
+                        return 'cancel';
+                    }
+                    const codeMatch = text.match(/^\d{6}$/);
+                    if (!codeMatch) {
+                        await tgSend(`Нужно ровно 6 цифр или /cancel. Пришло: "${rawText}"`);
+                        continue;
+                    }
+                    // Вводим код в модалку
+                    try {
+                        const codeInput = await waitForSelector(CODE_INPUT_SEL, 3000);
+                        await setInputValueVue(codeInput, codeMatch[0]);
+                        await sleep(300);
+                        const submitBtn = await waitForSelector(SUBMIT_SEL, 3000);
+                        submitBtn.click();
+                    } catch (e) {
+                        await tgSend(`❌ Не удалось ввести код: ${e.message || e}`);
+                        await setStorage({ tgLastOffset: offset });
+                        return 'cancel';
+                    }
+                    // Проверяем, закрылась ли модалка
+                    try {
+                        await waitForSelectorGone(MODAL_SEL, 10000);
+                        await setStorage({ tgLastOffset: offset });
+                        return 'done';
+                    } catch (e) {
+                        await tgSend('Код не принят, пришли актуальный (6 цифр).');
+                    }
+                }
+                await setStorage({ tgLastOffset: offset });
+            } catch (e) {
+                console.error('wait2FA poll:', e);
+                // Единоразово шлём в TG, чтоб юзер понял почему нет ответа
+                if (!wait2FA._reportedError) {
+                    wait2FA._reportedError = true;
+                    await tgSend(`⚠ TG poll error: ${e.description || e.message || e}`).catch(() => {});
+                }
+                await sleep(3000);
+            }
+        } else {
+            await sleep(500);
+        }
+    }
+    return 'timeout';
+}
+
+// Recovery-поллер: запускается на edit-странице после ошибки/aborted. Поддерживает:
+// /cancel — возврат на главную, мониторинг продолжается;
+// /change <цена> — попытка снова, навигация на edit с новой целью;
+// /status — отчёт по застрявшему состоянию;
+// /help.
+async function runTgRecoveryLoop(cfg) {
+    const start = Date.now();
+    const MAX_WAIT = 60 * 60 * 1000; // 1 час; после страница так и стоит — пользователь придёт домой и кликнет Отменить
+    let { tgLastOffset } = await getStorage(['tgLastOffset']);
+    let offset = tgLastOffset || 0;
+
+    console.log('[bingx-monitor] TG recovery loop started');
+    while (Date.now() - start < MAX_WAIT) {
+        try {
+            const updates = await tgPollUpdates(cfg.token, offset, 25);
+            for (const u of updates) {
+                offset = u.update_id + 1;
+                const msg = u.message;
+                if (!msg || !msg.chat) continue;
+                if (String(msg.chat.id) !== String(cfg.chatId)) continue;
+                const rawText = (msg.text || '').trim();
+                const text = rawText.replace(/\s+/g, '');
+                if (!rawText) continue;
+
+                if (/^\/?cancel$/i.test(text)) {
+                    await setStorage({ tgLastOffset: offset });
+                    await tgSend('❌ Откат. Возвращаюсь на главную, мониторинг продолжается.');
+                    await setAutoState({ state: 'cooldown' });
+                    await sleep(500);
+                    window.location.href = P2P_MAIN_URL;
+                    return;
+                }
+
+                const changeMatch = rawText.match(/^\/?change\s+(\d+(?:[\.,]\d+)?)\s*$/i);
+                if (changeMatch) {
+                    const target = parseFloat(changeMatch[1].replace(',', '.'));
+                    if (isNaN(target) || target <= 0) {
+                        await tgSend('Цена не парсится. /change 36.55');
+                        continue;
+                    }
+                    const d = await getStorage(['lastOrderNo', 'userPrice']);
+                    if (!d.lastOrderNo) {
+                        await tgSend('Нет orderNo. Сначала /cancel и попробуй снова, когда будешь дома.');
+                        continue;
+                    }
+                    await setStorage({ tgLastOffset: offset });
+                    await tgSend(`⚠ Перепопытка: ${target} THB. Иду на edit, жду 2FA.`);
+                    await setStorage({
+                        autoUpdate: {
+                            state: 'goto_edit',
+                            target,
+                            orderNo: d.lastOrderNo,
+                            competitor: null,
+                            oldPrice: d.userPrice,
+                            startedAt: Date.now()
+                        }
+                    });
+                    await sleep(300);
+                    window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(d.lastOrderNo)}`;
+                    return;
+                }
+
+                if (/^\/?status$/i.test(text)) {
+                    const d = await getStorage(['userPrice', 'autoUpdate', 'lastOrderNo']);
+                    await tgSend([
+                        '🛑 Состояние: aborted',
+                        `Причина: ${d.autoUpdate?.reason || '—'}`,
+                        `Цена в панели: ${d.userPrice ?? '—'} THB`,
+                        `orderNo: ${d.lastOrderNo || '—'}`,
+                        '',
+                        'Доступно: /cancel, /change <цена>'
+                    ].join('\n'));
+                    continue;
+                }
+
+                if (/^\/?help$/i.test(text)) {
+                    await tgSend([
+                        'Я застрял на edit-странице. Команды:',
+                        '/cancel — отбой, домой к мониторингу',
+                        '/change 36.55 — повторить с другой ценой',
+                        '/status — детали'
+                    ].join('\n'));
+                    continue;
+                }
+
+                if (rawText.startsWith('/')) {
+                    await tgSend(`Неизвестно: ${rawText}\n/help`);
+                }
+            }
+            await setStorage({ tgLastOffset: offset });
+        } catch (e) {
+            console.error('recovery poll:', e);
+            await sleep(5000);
+        }
+    }
+    console.log('[bingx-monitor] TG recovery loop timed out (1 hour)');
+}
+
+// Постоянный TG-поллинг на главной P2P-странице. Слушает команды:
+// /change <цена>, /status, /help. Команда /cancel живёт только в wait2FA.
+async function startTgMainPoll() {
+    if (tgMainPollCtx) return; // уже запущен
+    if (!isOnMainPage()) return; // только на главной
+    const cfg = await tgGetConfig();
+    if (!cfg.enabled) return;
+
+    const ctx = { aborted: false };
+    tgMainPollCtx = ctx;
+    console.log('[bingx-monitor] TG main poll started');
+
+    await tgDeleteWebhook(cfg.token);
+
+    let { tgLastOffset } = await getStorage(['tgLastOffset']);
+    let offset = tgLastOffset || 0;
+
+    // Дренаж старых апдейтов (не реагируем на команды, отправленные до запуска поллинга,
+    // чтобы при перезапуске монитора не сработала /change годичной давности).
+    try {
+        const stale = await tgPollUpdates(cfg.token, offset, 0);
+        if (stale.length) {
+            offset = stale[stale.length - 1].update_id + 1;
+            await setStorage({ tgLastOffset: offset });
+        }
+    } catch (e) {
+        console.error('TG main stale drain:', e);
+    }
+
+    while (!ctx.aborted) {
+        try {
+            const updates = await tgPollUpdates(cfg.token, offset, 25);
+            for (const u of updates) {
+                offset = u.update_id + 1;
+                if (ctx.aborted) break;
+                const navigated = await handleTgMainCommand(cfg, u);
+                if (navigated) {
+                    await setStorage({ tgLastOffset: offset });
+                    return; // страница уходит в навигацию
+                }
+            }
+            await setStorage({ tgLastOffset: offset });
+        } catch (e) {
+            console.error('TG main poll:', e);
+            await sleep(5000);
+        }
+    }
+    console.log('[bingx-monitor] TG main poll stopped');
+}
+
+function stopTgMainPoll() {
+    if (tgMainPollCtx) {
+        tgMainPollCtx.aborted = true;
+        tgMainPollCtx = null;
+    }
+}
+
+// Возвращает true, если запустили навигацию (чтобы внешний цикл вышел).
+async function handleTgMainCommand(cfg, update) {
+    const msg = update.message;
+    if (!msg || !msg.chat) return false;
+    if (String(msg.chat.id) !== String(cfg.chatId)) return false;
+    const rawText = (msg.text || '').trim();
+    if (!rawText) return false;
+
+    // /change <цена>
+    const changeMatch = rawText.match(/^\/?change\s+(\d+(?:[\.,]\d+)?)\s*$/i);
+    if (changeMatch) {
+        const target = parseFloat(changeMatch[1].replace(',', '.'));
+        if (isNaN(target) || target <= 0) {
+            await tgSend('Цена не парсится. Пример: /change 36.55');
+            return false;
+        }
+        const d = await getStorage(['lastOrderNo', 'userPrice']);
+        if (!d.lastOrderNo) {
+            await tgSend('Нет сохранённого orderNo. Зайди дома вручную на /p2p/advert/edit?... один раз — он запомнится.');
+            return false;
+        }
+        await tgSend(`⚠ Меняю на ${target} THB по команде. Иду на edit, жду 2FA.`);
+        stopMonitoring();
+        await setStorage({
+            autoUpdate: {
+                state: 'goto_edit',
+                target,
+                orderNo: d.lastOrderNo,
+                competitor: null,
+                oldPrice: d.userPrice,
+                startedAt: Date.now()
+            }
+        });
+        await sleep(300);
+        window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(d.lastOrderNo)}`;
+        return true;
+    }
+
+    // /status
+    if (/^\/?status$/i.test(rawText)) {
+        const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome']);
+        const lines = [
+            `Мониторинг: ${d.isMonitoring ? 'вкл' : 'выкл'}`,
+            `Автоном: ${d.autonomousMode ? 'вкл' : 'выкл'}`,
+            `Не на месте: ${d.notAtHome ? 'вкл' : 'выкл'}`,
+            `Ваша цена: ${d.userPrice ?? '—'} THB`,
+            `orderNo: ${d.lastOrderNo || '—'}`
+        ];
+        if (lastBeepedMinPrice != null) lines.push(`Послед. конкурент: ${lastBeepedMinPrice} THB`);
+        await tgSend(lines.join('\n'));
+        return false;
+    }
+
+    // /help
+    if (/^\/?help$/i.test(rawText)) {
+        await tgSend([
+            'Команды:',
+            '/change 36.55 — изменить цену объявления (с 2FA через TG)',
+            '/status — текущее состояние',
+            '/cancel — отмена в момент ожидания 2FA',
+            '/help — это сообщение'
+        ].join('\n'));
+        return false;
+    }
+
+    // Неизвестные / явные команды
+    if (rawText.startsWith('/')) {
+        await tgSend(`Неизвестно: ${rawText}\nСм. /help`);
+    }
+    return false;
 }
 
 async function resumeAfterCooldown() {
@@ -674,9 +1105,18 @@ function createPanel() {
         <label>Имя мерчанта:</label>
         <input type="text" id="merchantName" placeholder="Ваше имя мерчанта">
         <label class="autonomous-label"><input type="checkbox" id="autonomousMode"> Автоном</label>
+        <label class="autonomous-label"><input type="checkbox" id="notAtHome" disabled> Не на месте</label>
         <span id="status" class="status"></span>
         <span id="error" class="error"></span>
         <button id="toggle-panel">↑</button>
+      </div>
+      <div class="row telegram-row" id="telegramRow" style="display:none;">
+        <label>TG bot token:</label>
+        <input type="password" id="telegramToken" placeholder="1234567:AAAA...">
+        <label>TG chat ID:</label>
+        <input type="text" id="telegramChatId" placeholder="123456789">
+        <button id="testTelegram">Тест</button>
+        <span id="telegramStatus"></span>
       </div>
       <div class="row alert-row" id="alertSubPanel" style="display:none;">
         <span class="alert-label">Цену перебили — изменить объявление:</span>
@@ -696,13 +1136,21 @@ function createPanel() {
         document.body.prepend(toggleButtonContainer);
 
         chrome.storage.local.get(
-            ['merchantName', 'userPrice', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo', 'autonomousMode'],
+            ['merchantName', 'userPrice', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
+             'autonomousMode', 'notAtHome', 'telegramToken', 'telegramChatId'],
             (data) => {
                 if (data.merchantName) document.getElementById('merchantName').value = data.merchantName;
                 if (data.userPrice) document.getElementById('userPrice').value = data.userPrice;
                 if (data.ignoredMerchants) document.getElementById('ignoredMerchants').value = data.ignoredMerchants;
                 if (data.lastOrderNo) document.getElementById('newOrderNo').value = data.lastOrderNo;
-                document.getElementById('autonomousMode').checked = !!data.autonomousMode;
+                const auto = !!data.autonomousMode;
+                document.getElementById('autonomousMode').checked = auto;
+                const naH = document.getElementById('notAtHome');
+                naH.disabled = !auto;
+                naH.checked = auto && !!data.notAtHome;
+                if (data.telegramToken) document.getElementById('telegramToken').value = data.telegramToken;
+                if (data.telegramChatId) document.getElementById('telegramChatId').value = data.telegramChatId;
+                document.getElementById('telegramRow').style.display = naH.checked ? 'flex' : 'none';
 
                 if (data.isPanelCollapsed) {
                     panel.classList.add('collapsed');
@@ -730,7 +1178,57 @@ function createPanel() {
             chrome.storage.local.set({ ignoredMerchants: document.getElementById('ignoredMerchants').value.trim() });
         });
         document.getElementById('autonomousMode').addEventListener('change', (e) => {
-            chrome.storage.local.set({ autonomousMode: e.target.checked });
+            const on = e.target.checked;
+            chrome.storage.local.set({ autonomousMode: on });
+            const naH = document.getElementById('notAtHome');
+            naH.disabled = !on;
+            if (!on) {
+                naH.checked = false;
+                chrome.storage.local.set({ notAtHome: false });
+                document.getElementById('telegramRow').style.display = 'none';
+                stopTgMainPoll();
+            }
+        });
+        document.getElementById('notAtHome').addEventListener('change', (e) => {
+            const on = e.target.checked;
+            chrome.storage.local.set({ notAtHome: on });
+            document.getElementById('telegramRow').style.display = on ? 'flex' : 'none';
+            if (on && monitoringIntervalId) {
+                startTgMainPoll().catch(err => console.error('TG poll start:', err));
+            } else {
+                stopTgMainPoll();
+            }
+        });
+        document.getElementById('telegramToken').addEventListener('input', () => {
+            chrome.storage.local.set({ telegramToken: document.getElementById('telegramToken').value.trim() });
+        });
+        document.getElementById('telegramChatId').addEventListener('input', () => {
+            chrome.storage.local.set({ telegramChatId: document.getElementById('telegramChatId').value.trim() });
+        });
+        document.getElementById('testTelegram').addEventListener('click', async () => {
+            const token = document.getElementById('telegramToken').value.trim();
+            const chatId = document.getElementById('telegramChatId').value.trim();
+            const statusEl = document.getElementById('telegramStatus');
+            if (!token || !chatId) {
+                statusEl.textContent = 'Заполни токен и chat ID';
+                statusEl.style.color = '#c62828';
+                return;
+            }
+            statusEl.textContent = 'отправка...';
+            statusEl.style.color = '#555';
+            try {
+                const res = await tgSendWith(token, chatId, 'BingX monitor: тест связи ✅');
+                if (res.ok) {
+                    statusEl.textContent = 'Отправлено';
+                    statusEl.style.color = '#2e7d32';
+                } else {
+                    statusEl.textContent = 'Ошибка: ' + (res.description || 'неизвестно');
+                    statusEl.style.color = '#c62828';
+                }
+            } catch (e) {
+                statusEl.textContent = 'Ошибка: ' + (e.message || e);
+                statusEl.style.color = '#c62828';
+            }
         });
 
         document.getElementById('checkSelectors').addEventListener('click', () => {
@@ -748,6 +1246,13 @@ function createPanel() {
                 document.getElementById('newPrice').value = '';
                 document.getElementById('newOrderNo').value = '';
                 document.getElementById('autonomousMode').checked = false;
+                const naH = document.getElementById('notAtHome');
+                naH.disabled = true;
+                naH.checked = false;
+                document.getElementById('telegramToken').value = '';
+                document.getElementById('telegramChatId').value = '';
+                document.getElementById('telegramRow').style.display = 'none';
+                document.getElementById('telegramStatus').textContent = '';
                 document.getElementById('status').textContent = 'Данные сброшены';
                 document.getElementById('error').textContent = '';
                 document.getElementById('startMonitoring').disabled = false;
