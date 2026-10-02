@@ -211,6 +211,29 @@
 #bingx-monitor-panel .telegram-row #telegramStatus {
     font-size: 12px;
 }
+
+#bingx-monitor-panel .totp-row {
+    background: #fff8e6;
+    margin: 0 -16px -8px -16px;
+    padding: 6px 16px;
+    border-top: 1px solid #f0dca8;
+}
+#bingx-monitor-panel .totp-row label {
+    white-space: nowrap;
+}
+#bingx-monitor-panel .totp-row input[type="password"] {
+    width: 240px;
+}
+#bingx-monitor-panel button#testTotp {
+    background-color: #e8a33d;
+}
+#bingx-monitor-panel button#testTotp:hover {
+    background-color: #c8872a;
+}
+#bingx-monitor-panel .totp-row #totpStatus {
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 #bingx-auto-overlay button#bingx-auto-cancel {
     padding: 6px 12px;
     background: #f44336;

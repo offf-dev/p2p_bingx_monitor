@@ -30,6 +30,13 @@ const SEL_LIMIT = '.flex.column-direction.text1.number > span:first-child';
 const SEL_LIMIT_RANGE = '.flex.column-direction.text1.number .p2p-calc-formula';
 const PRICE_TEXT_RE = /^[\d,]+(?:\.\d+)?\s*THB$/;
 
+// Модалка 2FA (появляется после "Готово"). Успех = модалка исчезла из DOM.
+const TWOFA_SEL = {
+    modal: '.security-verify-entry',
+    input: '.tl-input-inner',
+    submit: '.submit-btn'
+};
+
 const P2P_MAIN_URL = 'https://fiat.bingx.com/ru-ru/p2p';
 const EDIT_URL_BASE = 'https://fiat.bingx.com/ru-ru/p2p/advert/edit';
 
@@ -935,6 +942,110 @@ function stopMonitoring() {
     stopTgMainPoll();
 }
 
+// ===== TOTP (авто-2FA) =====
+// Seed хранится локально в chrome.storage.local и никуда не уходит: ни в страницу, ни в Telegram.
+function base32Decode(input) {
+    const clean = String(input).toUpperCase().replace(/[\s-]/g, '').replace(/=+$/, '');
+    if (!clean) throw new Error('Пустой seed');
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = 0, value = 0;
+    const out = [];
+    for (const ch of clean) {
+        const idx = alphabet.indexOf(ch);
+        if (idx === -1) throw new Error(`Недопустимый символ в seed: "${ch}"`);
+        value = (value << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            out.push((value >>> (bits - 8)) & 0xff);
+            bits -= 8;
+        }
+    }
+    if (!out.length) throw new Error('Seed слишком короткий');
+    return new Uint8Array(out);
+}
+
+// Принимает и голый base32, и ссылку otpauth://totp/...?secret=...&digits=6&period=30
+function parseTotpSecret(raw) {
+    const text = String(raw || '').trim();
+    if (!text) throw new Error('Seed не задан');
+    if (/^otpauth:\/\//i.test(text)) {
+        const url = new URL(text);
+        const secret = url.searchParams.get('secret');
+        if (!secret) throw new Error('В otpauth-ссылке нет secret');
+        return {
+            secret,
+            digits: Number(url.searchParams.get('digits')) || 6,
+            period: Number(url.searchParams.get('period')) || 30,
+            algorithm: (url.searchParams.get('algorithm') || 'SHA1').toUpperCase().replace(/^SHA/, 'SHA-')
+        };
+    }
+    return { secret: text, digits: 6, period: 30, algorithm: 'SHA-1' };
+}
+
+function totpSecondsLeft(period) {
+    const p = period || 30;
+    return p - Math.floor(Date.now() / 1000) % p;
+}
+
+// RFC 6238 на WebCrypto: HMAC от номера 30-секундного окна, динамическая обрезка.
+async function generateTotp(cfg, atMs) {
+    const { secret, digits = 6, period = 30, algorithm = 'SHA-1' } = cfg;
+    const key = await crypto.subtle.importKey(
+        'raw', base32Decode(secret), { name: 'HMAC', hash: algorithm }, false, ['sign']
+    );
+    const counter = Math.floor((atMs || Date.now()) / 1000 / period);
+    const buf = new ArrayBuffer(8);
+    const view = new DataView(buf);
+    view.setUint32(0, Math.floor(counter / 2 ** 32));
+    view.setUint32(4, counter >>> 0);
+    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf));
+    const offset = sig[sig.length - 1] & 0x0f;
+    const num = ((sig[offset] & 0x7f) << 24) | (sig[offset + 1] << 16) | (sig[offset + 2] << 8) | sig[offset + 3];
+    return String(num % 10 ** digits).padStart(digits, '0');
+}
+
+async function getTotpConfig() {
+    const d = await getStorage(['totpSecret', 'autoTotp']);
+    if (!d.autoTotp || !d.totpSecret) return { enabled: false };
+    try {
+        return { enabled: true, ...parseTotpSecret(d.totpSecret) };
+    } catch (e) {
+        return { enabled: false, error: e.message || String(e) };
+    }
+}
+
+// Вводим свой код в модалку и жмём Submit. Две попытки: если не приняли на границе
+// 30-секундного окна, ждём следующее и пробуем свежий код.
+async function runAutoTotp(cfg, attempts = 2) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const left = totpSecondsLeft(cfg.period);
+            if (left < 3) await sleep((left + 0.5) * 1000); // не отправлять код, который вот-вот истечёт
+
+            const code = await generateTotp(cfg);
+            const input = await waitForSelector(TWOFA_SEL.input, 3000);
+            await setInputValueVue(input, '');
+            await sleep(100);
+            const log = await setInputValueVue(input, code);
+            await sleep(300);
+            if (input.value.replace(/\s/g, '') !== code) {
+                return { ok: false, reason: `код не вставился в поле: "${input.value}" (${log.join(' | ')})` };
+            }
+
+            const submitBtn = await waitForSelector(TWOFA_SEL.submit, 3000);
+            submitBtn.click();
+            await waitForSelectorGone(TWOFA_SEL.modal, 10000);
+            return { ok: true };
+        } catch (e) {
+            console.warn(`[bingx-monitor] auto-2FA попытка ${i + 1}:`, e.message || e);
+            if (!document.querySelector(TWOFA_SEL.modal)) return { ok: true }; // всё-таки прошло
+            if (i + 1 >= attempts) return { ok: false, reason: e.message || String(e) };
+            await sleep(Math.min(31000, (totpSecondsLeft(cfg.period) + 1) * 1000));
+        }
+    }
+    return { ok: false, reason: 'код не принят' };
+}
+
 // ===== Edit page flow =====
 async function runEditPageFlow(params) {
     if (autoFlowRunning) return;
@@ -995,7 +1106,7 @@ async function runEditPageFlow(params) {
         doneBtn.click();
 
         updateAutoOverlayStatus('Жду окно 2FA...');
-        await waitForSelector('.security-verify-entry', MODAL_APPEAR_TIMEOUT_MS);
+        await waitForSelector(TWOFA_SEL.modal, MODAL_APPEAR_TIMEOUT_MS);
 
         renderAutoOverlayWith2FAInfo({
             status: 'Введите код Google Authenticator. Мониторинг возобновится автоматически после успеха.',
@@ -1003,58 +1114,83 @@ async function runEditPageFlow(params) {
         });
 
         const tgCfg = await tgGetConfig();
-        if (tgCfg.enabled) {
-            const lines = ['⏸ Дошёл до 2FA.'];
-            if (competitor != null) lines.push(`Конкурент: ${competitor} THB`);
-            if (oldPrice != null) lines.push(`Ваша: ${oldPrice} THB`);
-            if (target != null) lines.push(`Новая: ${target} THB`);
-            lines.push('', 'Пришли 6 цифр 2FA.');
-            lines.push('Своя цена вместо предложенной — просто число (напр. 37).');
-            lines.push('/cancel — отбой.');
-            await tgSend(lines.join('\n'));
+
+        // Авто-2FA: код генерим сами из seed — ни телефона, ни переписки.
+        const totpCfg = await getTotpConfig();
+        let twofaDone = false;
+        if (totpCfg.error) {
+            console.error('[bingx-monitor] seed 2FA не разобран:', totpCfg.error);
+            if (tgCfg.enabled) await tgSend(`⚠ Авто-2FA выключена: seed не разобран (${totpCfg.error}).`).catch(() => {});
+        }
+        if (totpCfg.enabled) {
+            updateAutoOverlayStatus('Авто-2FA: ввожу код...');
+            const res = await runAutoTotp(totpCfg);
+            if (res.ok) {
+                twofaDone = true;
+            } else {
+                console.warn('[bingx-monitor] auto-2FA failed:', res.reason);
+                updateAutoOverlayStatus(`Авто-2FA не прошла: ${res.reason}. Жду код вручную.`);
+                playBeep();
+                if (tgCfg.enabled) {
+                    await tgSend(`⚠ Авто-2FA не прошла: ${res.reason}\nПроверь seed и часы. Жду код вручную.`).catch(() => {});
+                }
+            }
         }
 
-        const outcome = await wait2FA(tgCfg, TWOFA_WAIT_TIMEOUT_MS);
-        if (outcome.type === 'retarget') {
-            // Пользователь прислал свою цену вместо кода — перезапускаем форму с новой целью.
-            if (!orderNo) throw new Error('Своя цена принята, но orderNo неизвестен — перезапуск невозможен.');
+        if (!twofaDone) {
             if (tgCfg.enabled) {
-                await tgSend(`🔁 Ставлю вашу цену ${outcome.price} THB вместо ${target}. Перезаполняю форму, жду 2FA.`).catch(() => {});
+                const lines = ['⏸ Дошёл до 2FA.'];
+                if (competitor != null) lines.push(`Конкурент: ${competitor} THB`);
+                if (oldPrice != null) lines.push(`Ваша: ${oldPrice} THB`);
+                if (target != null) lines.push(`Новая: ${target} THB`);
+                lines.push('', 'Пришли 6 цифр 2FA.');
+                lines.push('Своя цена вместо предложенной — просто число (напр. 37).');
+                lines.push('/cancel — отбой.');
+                await tgSend(lines.join('\n'));
             }
-            await setStorage({
-                autoUpdate: {
-                    state: 'goto_edit',
-                    target: outcome.price,
-                    orderNo,
-                    competitor,
-                    oldPrice,
-                    startedAt: Date.now()
+
+            const outcome = await wait2FA(tgCfg, TWOFA_WAIT_TIMEOUT_MS);
+            if (outcome.type === 'retarget') {
+                // Пользователь прислал свою цену вместо кода — перезапускаем форму с новой целью.
+                if (!orderNo) throw new Error('Своя цена принята, но orderNo неизвестен — перезапуск невозможен.');
+                if (tgCfg.enabled) {
+                    await tgSend(`🔁 Ставлю вашу цену ${outcome.price} THB вместо ${target}. Перезаполняю форму, жду 2FA.`).catch(() => {});
                 }
-            });
-            updateAutoOverlayStatus(`Новая цель: ${outcome.price} THB. Перезапуск формы...`);
-            await sleep(500);
-            navigateToEdit(orderNo);
-            return;
-        }
-        if (outcome.type === 'cancel') {
-            // Soft cancel — цена не сохранена, но возвращаемся на главную и продолжаем мониторинг.
-            // Уведомление в TG уже отправлено из wait2FA одним сообщением.
-            await setAutoState({ state: 'cooldown' });
-            updateAutoOverlayStatus('Отменено. Возврат на главную...');
-            await sleep(COOLDOWN_MS);
-            window.location.href = P2P_MAIN_URL;
-            return;
-        }
-        if (outcome.type === 'timeout') {
-            // Soft recovery: вместо мёртвого аборта возвращаемся на главную, мониторинг + поллинг продолжатся.
-            if (tgCfg.enabled) {
-                await tgSend('⏱ Таймаут 2FA. Возвращаюсь на главную, мониторинг продолжается. /change <цена> — ручная смена.').catch(() => {});
+                await setStorage({
+                    autoUpdate: {
+                        state: 'goto_edit',
+                        target: outcome.price,
+                        orderNo,
+                        competitor,
+                        oldPrice,
+                        startedAt: Date.now()
+                    }
+                });
+                updateAutoOverlayStatus(`Новая цель: ${outcome.price} THB. Перезапуск формы...`);
+                await sleep(500);
+                navigateToEdit(orderNo);
+                return;
             }
-            await setAutoState({ state: 'cooldown' });
-            updateAutoOverlayStatus('Таймаут 2FA. Возврат на главную...');
-            await sleep(COOLDOWN_MS);
-            window.location.href = P2P_MAIN_URL;
-            return;
+            if (outcome.type === 'cancel') {
+                // Soft cancel — цена не сохранена, но возвращаемся на главную и продолжаем мониторинг.
+                // Уведомление в TG уже отправлено из wait2FA одним сообщением.
+                await setAutoState({ state: 'cooldown' });
+                updateAutoOverlayStatus('Отменено. Возврат на главную...');
+                await sleep(COOLDOWN_MS);
+                window.location.href = P2P_MAIN_URL;
+                return;
+            }
+            if (outcome.type === 'timeout') {
+                // Soft recovery: вместо мёртвого аборта возвращаемся на главную, мониторинг + поллинг продолжатся.
+                if (tgCfg.enabled) {
+                    await tgSend('⏱ Таймаут 2FA. Возвращаюсь на главную, мониторинг продолжается. /change <цена> — ручная смена.').catch(() => {});
+                }
+                await setAutoState({ state: 'cooldown' });
+                updateAutoOverlayStatus('Таймаут 2FA. Возврат на главную...');
+                await sleep(COOLDOWN_MS);
+                window.location.href = P2P_MAIN_URL;
+                return;
+            }
         }
 
         await setStorage({ userPrice: target });
@@ -1088,9 +1224,9 @@ async function runEditPageFlow(params) {
 // Возвращает: {type:'done'|'cancel'|'timeout'} | {type:'retarget', price}.
 async function wait2FA(tgCfg, timeoutMs) {
     const start = Date.now();
-    const MODAL_SEL = '.security-verify-entry';
-    const CODE_INPUT_SEL = '.tl-input-inner';
-    const SUBMIT_SEL = '.submit-btn';
+    const MODAL_SEL = TWOFA_SEL.modal;
+    const CODE_INPUT_SEL = TWOFA_SEL.input;
+    const SUBMIT_SEL = TWOFA_SEL.submit;
 
     let offset = 0;
     if (tgCfg.enabled) {
@@ -1426,11 +1562,12 @@ async function handleTgMainCommand(cfg, update) {
 
     // /status
     if (/^\/?status$/i.test(rawText)) {
-        const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome', 'priceFloor', 'priceCeil']);
+        const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome', 'priceFloor', 'priceCeil', 'autoTotp', 'totpSecret']);
         const lines = [
             `Мониторинг: ${d.isMonitoring ? 'вкл' : 'выкл'}`,
             `Автоном: ${d.autonomousMode ? 'вкл' : 'выкл'}`,
             `Не на месте: ${d.notAtHome ? 'вкл' : 'выкл'}`,
+            `Авто-2FA: ${(d.autoTotp && d.totpSecret) ? 'вкл' : 'выкл'}`,
             `Ваша цена: ${d.userPrice ?? '—'} THB`,
             `Предел: ${d.priceFloor ?? '—'} THB, потолок: ${d.priceCeil ?? '—'} THB`,
             `orderNo: ${d.lastOrderNo || '—'}`
@@ -1538,6 +1675,13 @@ function createPanel() {
         <button id="testTelegram">Тест</button>
         <span id="telegramStatus"></span>
       </div>
+      <div class="row totp-row" id="totpRow" style="display:none;">
+        <label class="autonomous-label"><input type="checkbox" id="autoTotp"> Авто-2FA</label>
+        <label>Seed (base32):</label>
+        <input type="password" id="totpSecret" placeholder="JBSWY3DP... или otpauth://">
+        <button id="testTotp">Код</button>
+        <span id="totpStatus"></span>
+      </div>
       <div class="row alert-row" id="alertSubPanel" style="display:none;">
         <span class="alert-label">Цену перебили — изменить объявление:</span>
         <label>Новая цена:</label>
@@ -1557,7 +1701,7 @@ function createPanel() {
 
         chrome.storage.local.get(
             ['merchantName', 'userPrice', 'priceFloor', 'priceCeil', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
-             'autonomousMode', 'notAtHome', 'telegramToken', 'telegramChatId'],
+             'autonomousMode', 'notAtHome', 'telegramToken', 'telegramChatId', 'autoTotp', 'totpSecret'],
             (data) => {
                 if (data.merchantName) document.getElementById('merchantName').value = data.merchantName;
                 if (data.userPrice) document.getElementById('userPrice').value = data.userPrice;
@@ -1573,6 +1717,9 @@ function createPanel() {
                 if (data.telegramToken) document.getElementById('telegramToken').value = data.telegramToken;
                 if (data.telegramChatId) document.getElementById('telegramChatId').value = data.telegramChatId;
                 document.getElementById('telegramRow').style.display = naH.checked ? 'flex' : 'none';
+                document.getElementById('autoTotp').checked = !!data.autoTotp;
+                if (data.totpSecret) document.getElementById('totpSecret').value = data.totpSecret;
+                document.getElementById('totpRow').style.display = auto ? 'flex' : 'none';
 
                 if (data.isPanelCollapsed) {
                     panel.classList.add('collapsed');
@@ -1640,11 +1787,43 @@ function createPanel() {
             chrome.storage.local.set({ autonomousMode: on });
             const naH = document.getElementById('notAtHome');
             naH.disabled = !on;
+            document.getElementById('totpRow').style.display = on ? 'flex' : 'none';
             if (!on) {
                 naH.checked = false;
                 chrome.storage.local.set({ notAtHome: false });
                 document.getElementById('telegramRow').style.display = 'none';
                 stopTgMainPoll();
+            }
+        });
+        document.getElementById('autoTotp').addEventListener('change', (e) => {
+            chrome.storage.local.set({ autoTotp: e.target.checked });
+        });
+        document.getElementById('totpSecret').addEventListener('input', () => {
+            const raw = document.getElementById('totpSecret').value.trim();
+            const statusEl = document.getElementById('totpStatus');
+            if (raw === '') {
+                chrome.storage.local.remove('totpSecret');
+                statusEl.textContent = '';
+                return;
+            }
+            try {
+                parseTotpSecret(raw);
+                chrome.storage.local.set({ totpSecret: raw });
+                statusEl.textContent = 'seed принят';
+            } catch (err) {
+                statusEl.textContent = err.message || String(err);
+            }
+        });
+        // Сверка с телефоном: код живёт 30 сек, цифры должны совпасть с приложением.
+        document.getElementById('testTotp').addEventListener('click', async () => {
+            const statusEl = document.getElementById('totpStatus');
+            const raw = document.getElementById('totpSecret').value.trim();
+            try {
+                const cfg = parseTotpSecret(raw);
+                const code = await generateTotp(cfg);
+                statusEl.textContent = `${code} (${totpSecondsLeft(cfg.period)} с)`;
+            } catch (err) {
+                statusEl.textContent = `Ошибка: ${err.message || err}`;
             }
         });
         document.getElementById('notAtHome').addEventListener('change', (e) => {
@@ -1714,6 +1893,10 @@ function createPanel() {
                 document.getElementById('telegramChatId').value = '';
                 document.getElementById('telegramRow').style.display = 'none';
                 document.getElementById('telegramStatus').textContent = '';
+                document.getElementById('autoTotp').checked = false;
+                document.getElementById('totpSecret').value = '';
+                document.getElementById('totpStatus').textContent = '';
+                document.getElementById('totpRow').style.display = 'none';
                 document.getElementById('status').textContent = 'Данные сброшены';
                 document.getElementById('error').textContent = '';
                 document.getElementById('startMonitoring').disabled = false;
