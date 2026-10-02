@@ -27,6 +27,7 @@ const SEL_ROWS = '.p2p-adverts-table .row-item';
 const SEL_NAME = '.cursor-pointer.ellipsis.weight-bolder';
 const SEL_PRICE = '.number.text1.weight-bolder';
 const SEL_LIMIT = '.flex.column-direction.text1.number > span:first-child';
+const SEL_LIMIT_RANGE = '.flex.column-direction.text1.number .p2p-calc-formula';
 const PRICE_TEXT_RE = /^[\d,]+(?:\.\d+)?\s*THB$/;
 
 const P2P_MAIN_URL = 'https://fiat.bingx.com/ru-ru/p2p';
@@ -253,22 +254,39 @@ async function tgGetConfig() {
     return { token: d.telegramToken, chatId: d.telegramChatId, enabled };
 }
 
-async function tgSend(text) {
+async function tgSend(text, opts) {
     const { token, chatId, enabled } = await tgGetConfig();
     if (!enabled) return false;
+    const html = !!(opts && opts.html);
+    const post = (body) => fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    }).then(r => r.json());
     try {
-        const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
-        });
-        const json = await res.json();
+        const base = { chat_id: chatId, text, disable_web_page_preview: true };
+        let json = await post(html ? { ...base, parse_mode: 'HTML' } : base);
+        if (!json.ok && html) {
+            // Кривая разметка не должна съедать сообщение целиком — шлём как есть, без тегов.
+            console.warn('TG HTML parse failed, retry plain:', json);
+            json = await post({ ...base, text: stripHtml(text) });
+        }
         if (!json.ok) console.warn('TG sendMessage not ok:', json);
         return json.ok;
     } catch (e) {
         console.error('TG send:', e);
         return false;
     }
+}
+
+function escapeHtml(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function stripHtml(text) {
+    return String(text)
+        .replace(/<\/?pre>\n?/g, '')
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 }
 
 // Принудительная отправка с конкретным конфигом (для кнопки "Тест").
@@ -447,7 +465,7 @@ async function onApplyPriceChange() {
 
 // Универсальный триггер авто-редактирования. target — итоговая цена; refPrice — конкурент-якорь
 // (для записи в state и сообщений); shortMsg/tgMsg — описание причины.
-async function triggerAutonomousEdit({ target, refPrice, oldPrice, orderNo, shortMsg, tgMsg }) {
+async function triggerAutonomousEdit({ target, refPrice, oldPrice, orderNo, shortMsg, tgMsg, tgHtml }) {
     const { autoUpdate } = await getStorage(['autoUpdate']);
     if (autoUpdate && autoUpdate.state && autoUpdate.state !== 'idle') return;
 
@@ -468,7 +486,7 @@ async function triggerAutonomousEdit({ target, refPrice, oldPrice, orderNo, shor
         }
     });
     showMessage(shortMsg || `Автоном: ${oldPrice} → ${target}. Переход...`);
-    if (tgMsg) tgSend(tgMsg).catch(() => {});
+    if (tgMsg) tgSend(tgMsg, { html: !!tgHtml }).catch(() => {});
     await sleep(300);
     window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(orderNo)}`;
 }
@@ -481,6 +499,146 @@ function findPriceEl(row) {
     if (byClass) return byClass;
     return Array.from(row.querySelectorAll('td div, td span'))
         .find(el => !el.children.length && PRICE_TEXT_RE.test(el.textContent.trim())) || null;
+}
+
+// Снимок всей таблицы объявлений: имя / цена / доступный объём / лимиты по каждому ряду.
+// cleanInputName и ignored — уже очищенные от эмодзи имена, чтобы проставить флаги isOwn/ignored.
+function collectMerchantRows(cleanInputName, ignored) {
+    const ignoredList = ignored || [];
+    const out = [];
+    document.querySelectorAll(SEL_ROWS).forEach((row) => {
+        const nameEl = row.querySelector(SEL_NAME);
+        const priceEl = findPriceEl(row);
+        const limitEl = row.querySelector(SEL_LIMIT);
+        const rangeEl = row.querySelector(SEL_LIMIT_RANGE);
+
+        const name = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
+        let price = null, priceStr = null;
+        if (priceEl) {
+            priceStr = priceEl.textContent.replace(' THB', '').replace(/,/g, '').trim();
+            const parsed = parseFloat(priceStr);
+            price = isNaN(parsed) ? null : parsed;
+            if (price === null) priceStr = null;
+        }
+        let available = null;
+        const availableStr = limitEl ? limitEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        if (limitEl) {
+            const parsed = parseFloat(availableStr.replace(' USDT', '').replace(/,/g, '').trim());
+            if (!isNaN(parsed)) available = parsed;
+        }
+        const range = rangeEl ? rangeEl.textContent.replace(/\s+/g, ' ').trim() : '';
+        const rangeNums = (range.match(/[\d][\d,]*(?:\.\d+)?/g) || [])
+            .map(n => parseFloat(n.replace(/,/g, '')))
+            .filter(n => !isNaN(n));
+        out.push({
+            name,
+            price,
+            priceStr,
+            available,
+            availableStr,
+            hasLimit: !!limitEl,
+            range,
+            rangeMin: rangeNums.length > 1 ? rangeNums[0] : null,
+            rangeMax: rangeNums.length > 1 ? rangeNums[1] : null,
+            isOwn: !!cleanInputName && name.includes(cleanInputName),
+            ignored: ignoredList.includes(name)
+        });
+    });
+    return out;
+}
+
+// 3000 → 3k, 16874 → 17k, 460.8 → 461, 20.52 → 20.5 — чтобы колонки не расползались.
+function fmtAmountShort(n) {
+    if (n === null || n === undefined || isNaN(n)) return '—';
+    if (n >= 10000) return Math.round(n / 1000) + 'k';
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    if (n >= 100) return String(Math.round(n));
+    return n.toFixed(1).replace(/\.0$/, '');
+}
+
+// Выравнивание цен по десятичной точке: "36.62" при maxFrac=3 → "36.62 ".
+function padPriceCell(priceStr, maxFrac) {
+    const dot = priceStr.indexOf('.');
+    const frac = dot === -1 ? 0 : priceStr.length - dot - 1;
+    return priceStr + (dot === -1 && maxFrac > 0 ? ' ' : '') + ' '.repeat(maxFrac - frac);
+}
+
+function truncName(name, max) {
+    if (!name) return '—';
+    return name.length > max ? name.slice(0, max - 1) + '…' : name;
+}
+
+// Стакан для Telegram: моноширинная таблица в <pre> (отправлять с { html: true }).
+// Колонки: цена | доступно USDT | лимиты THB | торговец. Свой ряд — «▶», игнор — «×».
+function formatMerchantsSummary(rows, opts) {
+    const { userPrice, priceFloor, max = 12 } = opts || {};
+    const listed = rows.filter(r => r.price !== null).sort((a, b) => a.price - b.price);
+    if (!listed.length) return '';
+
+    const entries = listed.slice(0, max).map(r => ({
+        price: r.price,
+        priceStr: r.priceStr,
+        vol: fmtAmountShort(r.available),
+        lim: (r.rangeMin !== null && r.rangeMax !== null)
+            ? `${fmtAmountShort(r.rangeMin)}-${fmtAmountShort(r.rangeMax)}`
+            : '—',
+        name: truncName(r.name, 12),
+        mark: r.isOwn ? '▶' : (r.ignored ? '×' : ' ')
+    }));
+
+    // Своего ряда в таблице нет (имя мерчанта не задано) — ставим ориентир по цене из панели.
+    const hasOwn = entries.some(e => e.mark === '▶');
+    if (userPrice && !hasOwn) {
+        const at = entries.findIndex(e => e.price > userPrice);
+        entries.splice(at === -1 ? entries.length : at, 0, {
+            price: userPrice, priceStr: String(userPrice), vol: '—', lim: '—', name: 'вы', mark: '▶'
+        });
+    }
+
+    const maxFrac = entries.reduce((m, e) => {
+        const dot = e.priceStr.indexOf('.');
+        return Math.max(m, dot === -1 ? 0 : e.priceStr.length - dot - 1);
+    }, 0);
+    const cells = entries.map(e => ({ ...e, priceCell: padPriceCell(e.priceStr, maxFrac) }));
+
+    const head = ['цена', 'USDT', 'лимит', 'торговец'];
+    const wPrice = Math.max(head[0].length, ...cells.map(c => c.priceCell.length));
+    const wVol = Math.max(head[1].length, ...cells.map(c => c.vol.length));
+    const wLim = Math.max(head[2].length, ...cells.map(c => c.lim.length));
+
+    const row = (mark, price, vol, lim, name) =>
+        mark + price.padEnd(wPrice) + ' ' + vol.padStart(wVol) + ' ' + lim.padEnd(wLim) + ' ' + name;
+
+    const table = [row(' ', head[0], head[1], head[2], head[3])];
+    // Черту предела рисуем только там, где она реально делит стакан.
+    const splitAt = priceFloor ? cells.findIndex(c => c.price > priceFloor) : -1;
+    const floorSplits = splitAt > 0;
+    cells.forEach((c, i) => {
+        if (floorSplits && i === splitAt) table.push(null); // место под черту, ширину знаем позже
+        table.push(row(c.mark, c.priceCell, c.vol, c.lim, escapeHtml(c.name)));
+    });
+    const width = Math.max(...table.filter(Boolean).map(l => l.replace(/&[a-z]+;/g, 'x').length));
+    const body = table.map(l => l === null ? floorSeparator(priceFloor, width) : l).join('\n');
+
+    const legend = [];
+    if (listed.length > entries.length) legend.push(`ещё ${listed.length - entries.length} дороже`);
+    legend.push('▶ вы');
+    if (cells.some(c => c.mark === '×')) legend.push('× игнор');
+    if (priceFloor && !floorSplits) legend.push(`предел ${priceFloor}`);
+    legend.push('лимиты THB');
+
+    return [
+        `📋 Стакан (${listed.length}):`,
+        '<pre>' + body + '</pre>',
+        escapeHtml(legend.join(' · '))
+    ].join('\n');
+}
+
+function floorSeparator(priceFloor, width) {
+    const label = ` предел ${priceFloor} `;
+    const left = Math.max(2, Math.floor((width - label.length) / 2));
+    const right = Math.max(2, width - left - label.length);
+    return '─'.repeat(left) + label + '─'.repeat(right);
 }
 
 // Возвращает счётчики по каждому селектору, чтобы при поломке вёрстки было видно, что именно отвалилось.
@@ -553,33 +711,12 @@ function performCycle() {
                 : [];
 
             try {
-                const rows = document.querySelectorAll(SEL_ROWS);
                 const cleanInputName = merchantName ? removeEmojis(merchantName) : '';
-                const competitors = []; // {price, priceStr} в порядке появления, ниже отсортируем
-                let foundOwnRow = false;
-                let currentLimit = null;
-
-                rows.forEach((row) => {
-                    const nameEl = row.querySelector(SEL_NAME);
-                    const priceEl = findPriceEl(row);
-                    const limitEl = row.querySelector(SEL_LIMIT);
-
-                    const cleanName = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
-                    const isOwnRow = !!cleanInputName && cleanName.includes(cleanInputName);
-
-                    if (priceEl && !isOwnRow && !ignoredMerchants.includes(cleanName)) {
-                        const priceStr = priceEl.textContent.replace(' THB', '').replace(/,/g, '').trim();
-                        const price = parseFloat(priceStr);
-                        if (!isNaN(price)) competitors.push({ price, priceStr });
-                    }
-
-                    if (isOwnRow && limitEl) {
-                        foundOwnRow = true;
-                        const limitText = limitEl.textContent.replace(' USDT', '').replace(/,/g, '').trim();
-                        const parsed = parseFloat(limitText);
-                        if (!isNaN(parsed)) currentLimit = parsed;
-                    }
-                });
+                const allRows = collectMerchantRows(cleanInputName, ignoredMerchants);
+                const competitors = allRows.filter(r => !r.isOwn && !r.ignored && r.price !== null);
+                const ownRow = allRows.find(r => r.isOwn && r.hasLimit) || null;
+                const foundOwnRow = !!ownRow;
+                const currentLimit = ownRow ? ownRow.available : null;
 
                 competitors.sort((a, b) => a.price - b.price);
                 const leader = competitors[0] || null;
@@ -644,7 +781,11 @@ function performCycle() {
                         lastBeepedMinPrice = refPrice;
                         lastPriceBelowBeepAt = now;
                         if (data.autonomousMode) {
-                            tgSend(`⚠ Лидер на пределе ${refPrice} THB, других конкурентов выше нет. Реши: /change <цена>.`).catch(() => {});
+                            const summary = formatMerchantsSummary(allRows, { userPrice, priceFloor });
+                            tgSend([
+                                escapeHtml(`⚠ Лидер на пределе ${refPrice} THB, других конкурентов выше нет. Реши: /change <цена>.`),
+                                summary
+                            ].filter(Boolean).join('\n\n'), { html: true }).catch(() => {});
                         }
                     }
                     showAlertPanel({ suggestedTarget: null, label: `Лидер на пределе (${refPrice}). Введи цену вручную:` });
@@ -660,13 +801,20 @@ function performCycle() {
                     }
 
                     if (data.autonomousMode && data.lastOrderNo) {
+                        // Сводку по всей таблице шлём там, где цена двигается вверх вслепую:
+                        // предложенные 42 могут быть избыточны, когда хватает 37 — решает пользователь.
+                        const tgParts = [escapeHtml(describeTgMsg(mode, refPrice, userPrice, target))];
+                        if (mode === 'jumpAboveField' || mode === 'raiseToLeader') {
+                            tgParts.push(formatMerchantsSummary(allRows, { userPrice, priceFloor }));
+                        }
                         triggerAutonomousEdit({
                             target,
                             refPrice,
                             oldPrice: userPrice,
                             orderNo: data.lastOrderNo,
                             shortMsg: describeShortMsg(mode, refPrice, userPrice, target) + ' Переход...',
-                            tgMsg: describeTgMsg(mode, refPrice, userPrice, target)
+                            tgMsg: tgParts.filter(Boolean).join('\n\n'),
+                            tgHtml: true
                         }).catch(err => {
                             console.error('Autonomous trigger:', err);
                             showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) });
@@ -1147,6 +1295,21 @@ async function handleTgMainCommand(cfg, update) {
         return true;
     }
 
+    // /list — сводка по всем торговцам прямо сейчас
+    if (/^\/?(list|стакан)$/i.test(rawText)) {
+        const d = await getStorage(['merchantName', 'ignoredMerchants', 'userPrice', 'priceFloor']);
+        const cleanInputName = d.merchantName ? removeEmojis(d.merchantName) : '';
+        const ignored = d.ignoredMerchants
+            ? d.ignoredMerchants.split(',').map(n => removeEmojis(n.trim())).filter(Boolean)
+            : [];
+        const summary = formatMerchantsSummary(
+            collectMerchantRows(cleanInputName, ignored),
+            { userPrice: d.userPrice, priceFloor: d.priceFloor }
+        );
+        await tgSend(summary || 'Таблица не читается — проверь селекторы на странице.', { html: !!summary });
+        return false;
+    }
+
     // /status
     if (/^\/?status$/i.test(rawText)) {
         const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome']);
@@ -1167,6 +1330,7 @@ async function handleTgMainCommand(cfg, update) {
         await tgSend([
             'Команды:',
             '/change 36.55 — изменить цену объявления (с 2FA через TG)',
+            '/list — сводка по всем торговцам: цена / имя / доступно / лимиты',
             '/status — текущее состояние',
             '/cancel — отмена в момент ожидания 2FA',
             '/help — это сообщение'
