@@ -571,7 +571,7 @@ function truncName(name, max) {
 // Стакан для Telegram: моноширинная таблица в <pre> (отправлять с { html: true }).
 // Колонки: цена | доступно USDT | лимиты THB | торговец. Свой ряд — «▶», игнор — «×».
 function formatMerchantsSummary(rows, opts) {
-    const { userPrice, priceFloor, max = 12 } = opts || {};
+    const { userPrice, priceFloor, priceCeil, max = 12 } = opts || {};
     const listed = rows.filter(r => r.price !== null).sort((a, b) => a.price - b.price);
     if (!listed.length) return '';
 
@@ -609,22 +609,38 @@ function formatMerchantsSummary(rows, opts) {
     const row = (mark, price, vol, lim, name) =>
         mark + price.padEnd(wPrice) + ' ' + vol.padStart(wVol) + ' ' + lim.padEnd(wLim) + ' ' + name;
 
-    const table = [row(' ', head[0], head[1], head[2], head[3])];
-    // Черту предела рисуем только там, где она реально делит стакан.
-    const splitAt = priceFloor ? cells.findIndex(c => c.price > priceFloor) : -1;
-    const floorSplits = splitAt > 0;
-    cells.forEach((c, i) => {
-        if (floorSplits && i === splitAt) table.push(null); // место под черту, ширину знаем позже
-        table.push(row(c.mark, c.priceCell, c.vol, c.lim, escapeHtml(c.name)));
+    const header = row(' ', head[0], head[1], head[2], head[3]);
+    const rowLines = cells.map(c => row(c.mark, c.priceCell, c.vol, c.lim, escapeHtml(c.name)));
+    const visibleLen = (l) => l.replace(/&[a-z]+;/g, 'x').length;
+    const width = Math.max(...[header, ...rowLines].map(visibleLen));
+
+    // Черты предела и потолка рисуем только там, где они реально делят стакан;
+    // иначе уровень уходит в подпись, чтобы не занимать строку зря.
+    const offTable = [];
+    const marks = new Map(); // индекс строки → черта(ы) перед ней
+    [[priceFloor, 'предел'], [priceCeil, 'потолок']].forEach(([level, word]) => {
+        if (!level) return;
+        const at = cells.findIndex(c => c.price > level);
+        if (at > 0) {
+            const line = levelSeparator(`${word} ${level}`, width);
+            marks.set(at, marks.has(at) ? marks.get(at) + '\n' + line : line);
+        } else {
+            offTable.push(`${word} ${level}`);
+        }
     });
-    const width = Math.max(...table.filter(Boolean).map(l => l.replace(/&[a-z]+;/g, 'x').length));
-    const body = table.map(l => l === null ? floorSeparator(priceFloor, width) : l).join('\n');
+
+    const table = [header];
+    rowLines.forEach((line, i) => {
+        if (marks.has(i)) table.push(marks.get(i));
+        table.push(line);
+    });
+    const body = table.join('\n');
 
     const legend = [];
     if (listed.length > entries.length) legend.push(`ещё ${listed.length - entries.length} дороже`);
     legend.push('▶ вы');
     if (cells.some(c => c.mark === '×')) legend.push('× игнор');
-    if (priceFloor && !floorSplits) legend.push(`предел ${priceFloor}`);
+    legend.push(...offTable);
     legend.push('лимиты THB');
 
     return [
@@ -634,8 +650,8 @@ function formatMerchantsSummary(rows, opts) {
     ].join('\n');
 }
 
-function floorSeparator(priceFloor, width) {
-    const label = ` предел ${priceFloor} `;
+function levelSeparator(text, width) {
+    const label = ` ${text} `;
     const left = Math.max(2, Math.floor((width - label.length) / 2));
     const right = Math.max(2, width - left - label.length);
     return '─'.repeat(left) + label + '─'.repeat(right);
@@ -712,7 +728,7 @@ function describeAlertLabel(mode, refPrice) {
 
 function performCycle() {
     chrome.storage.local.get(
-        ['userPrice', 'priceFloor', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit', 'autonomousMode', 'lastOrderNo'],
+        ['userPrice', 'priceFloor', 'priceCeil', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit', 'autonomousMode', 'lastOrderNo'],
         (data) => {
             if (!data.isMonitoring) {
                 stopMonitoring();
@@ -721,6 +737,9 @@ function performCycle() {
 
             const userPrice = data.userPrice;
             const priceFloor = (typeof data.priceFloor === 'number' && data.priceFloor > 0) ? data.priceFloor : null;
+            const priceCeilRaw = (typeof data.priceCeil === 'number' && data.priceCeil > 0) ? data.priceCeil : null;
+            // Потолок ниже предела — бессмысленная пара, игнорируем потолок (в панели это подсвечено).
+            const priceCeil = (priceCeilRaw && priceFloor && priceCeilRaw < priceFloor) ? null : priceCeilRaw;
             const merchantName = data.merchantName;
             const ignoredMerchants = data.ignoredMerchants
                 ? data.ignoredMerchants.split(',').map(n => removeEmojis(n.trim())).filter(Boolean)
@@ -786,6 +805,22 @@ function performCycle() {
                     }
                 }
 
+                // ===== Потолок =====
+                // Конкурент на 38 → формула даёт 37.99, но если нам и 37 достаточно —
+                // паркуемся на потолке и больше не дёргаемся, пока он не изменится.
+                let capped = false;
+                if (mode && mode !== 'loneAboveFloor' && target !== null && priceCeil && target > priceCeil) {
+                    target = priceCeil;
+                    capped = true;
+                    if (Math.abs(target - userPrice) <= 1e-6) {
+                        // Уже стоим на потолке — менять нечего.
+                        mode = null;
+                        target = null;
+                        refPrice = null;
+                    }
+                }
+                const capNote = capped ? ` (потолок ${priceCeil})` : '';
+
                 // ===== Reaction =====
                 if (mode === 'loneAboveFloor') {
                     const now = Date.now();
@@ -797,7 +832,7 @@ function performCycle() {
                         lastBeepedMinPrice = refPrice;
                         lastPriceBelowBeepAt = now;
                         if (data.autonomousMode) {
-                            const summary = formatMerchantsSummary(allRows, { userPrice, priceFloor });
+                            const summary = formatMerchantsSummary(allRows, { userPrice, priceFloor, priceCeil });
                             tgSend([
                                 escapeHtml(`⚠ Лидер на пределе ${refPrice} THB, других конкурентов выше нет. Реши: /change <цена>.`),
                                 summary
@@ -811,7 +846,7 @@ function performCycle() {
                     const timeToRemind = now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS;
                     if (refChanged || timeToRemind) {
                         playBeep();
-                        showMessage(describeShortMsg(mode, refPrice, userPrice, target));
+                        showMessage(describeShortMsg(mode, refPrice, userPrice, target) + capNote);
                         lastBeepedMinPrice = refPrice;
                         lastPriceBelowBeepAt = now;
                     }
@@ -819,9 +854,9 @@ function performCycle() {
                     if (data.autonomousMode && data.lastOrderNo) {
                         // Сводку по всей таблице шлём там, где цена двигается вверх вслепую:
                         // предложенные 42 могут быть избыточны, когда хватает 37 — решает пользователь.
-                        const tgParts = [escapeHtml(describeTgMsg(mode, refPrice, userPrice, target))];
-                        if (mode === 'jumpAboveField' || mode === 'raiseToLeader') {
-                            tgParts.push(formatMerchantsSummary(allRows, { userPrice, priceFloor }));
+                        const tgParts = [escapeHtml(describeTgMsg(mode, refPrice, userPrice, target) + capNote)];
+                        if (mode === 'jumpAboveField' || mode === 'raiseToLeader' || capped) {
+                            tgParts.push(formatMerchantsSummary(allRows, { userPrice, priceFloor, priceCeil }));
                         }
                         tgParts.push(escapeHtml('Не согласен — пришли своё число (напр. 37) вместо кода 2FA, поставлю его.'));
                         triggerAutonomousEdit({
@@ -829,18 +864,18 @@ function performCycle() {
                             refPrice,
                             oldPrice: userPrice,
                             orderNo: data.lastOrderNo,
-                            shortMsg: describeShortMsg(mode, refPrice, userPrice, target) + ' Переход...',
+                            shortMsg: describeShortMsg(mode, refPrice, userPrice, target) + capNote + ' Переход...',
                             tgMsg: tgParts.filter(Boolean).join('\n\n'),
                             tgHtml: true
                         }).catch(err => {
                             console.error('Autonomous trigger:', err);
-                            showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) });
+                            showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) + capNote });
                         });
                     } else {
                         if (data.autonomousMode && !data.lastOrderNo) {
                             showMessage('Автоном: orderNo не захвачен. Открой edit вручную один раз.');
                         }
-                        showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) });
+                        showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) + capNote });
                     }
                 } else {
                     lastBeepedMinPrice = null;
@@ -1344,16 +1379,46 @@ async function handleTgMainCommand(cfg, update) {
         return true;
     }
 
+    // /cap 37 — потолок продажи, /cap off — снять, /cap — показать текущий
+    const capMatch = rawText.match(/^\/?(?:cap|потолок)(?:\s+(.+))?$/i);
+    if (capMatch) {
+        const arg = (capMatch[1] || '').trim();
+        const d = await getStorage(['priceCeil', 'priceFloor']);
+        if (!arg) {
+            await tgSend(d.priceCeil
+                ? `Потолок: ${d.priceCeil} THB. Снять — /cap off`
+                : 'Потолок не задан. Поставить — /cap 37');
+            return false;
+        }
+        if (/^(off|нет|снять|-|0)$/i.test(arg)) {
+            await new Promise(resolve => chrome.storage.local.remove('priceCeil', resolve));
+            await tgSend('Потолок снят — поднимаюсь под ближайшего конкурента.');
+            return false;
+        }
+        const v = parseFloat(arg.replace(',', '.'));
+        if (isNaN(v) || v <= 0) {
+            await tgSend('Цена не парсится. Пример: /cap 37');
+            return false;
+        }
+        if (d.priceFloor && v < d.priceFloor) {
+            await tgSend(`Потолок ${v} ниже предела ${d.priceFloor} THB — так нельзя.`);
+            return false;
+        }
+        await setStorage({ priceCeil: v });
+        await tgSend(`Потолок: ${v} THB. Выше не поднимаюсь${d.priceFloor ? `, ниже ${d.priceFloor} не опускаюсь` : ''}.`);
+        return false;
+    }
+
     // /list — сводка по всем торговцам прямо сейчас
     if (/^\/?(list|стакан)$/i.test(rawText)) {
-        const d = await getStorage(['merchantName', 'ignoredMerchants', 'userPrice', 'priceFloor']);
+        const d = await getStorage(['merchantName', 'ignoredMerchants', 'userPrice', 'priceFloor', 'priceCeil']);
         const cleanInputName = d.merchantName ? removeEmojis(d.merchantName) : '';
         const ignored = d.ignoredMerchants
             ? d.ignoredMerchants.split(',').map(n => removeEmojis(n.trim())).filter(Boolean)
             : [];
         const summary = formatMerchantsSummary(
             collectMerchantRows(cleanInputName, ignored),
-            { userPrice: d.userPrice, priceFloor: d.priceFloor }
+            { userPrice: d.userPrice, priceFloor: d.priceFloor, priceCeil: d.priceCeil }
         );
         await tgSend(summary || 'Таблица не читается — проверь селекторы на странице.', { html: !!summary });
         return false;
@@ -1361,12 +1426,13 @@ async function handleTgMainCommand(cfg, update) {
 
     // /status
     if (/^\/?status$/i.test(rawText)) {
-        const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome']);
+        const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome', 'priceFloor', 'priceCeil']);
         const lines = [
             `Мониторинг: ${d.isMonitoring ? 'вкл' : 'выкл'}`,
             `Автоном: ${d.autonomousMode ? 'вкл' : 'выкл'}`,
             `Не на месте: ${d.notAtHome ? 'вкл' : 'выкл'}`,
             `Ваша цена: ${d.userPrice ?? '—'} THB`,
+            `Предел: ${d.priceFloor ?? '—'} THB, потолок: ${d.priceCeil ?? '—'} THB`,
             `orderNo: ${d.lastOrderNo || '—'}`
         ];
         if (lastBeepedMinPrice != null) lines.push(`Послед. конкурент: ${lastBeepedMinPrice} THB`);
@@ -1380,6 +1446,7 @@ async function handleTgMainCommand(cfg, update) {
             'Команды:',
             '/change 36.55 (или просто 36.55) — изменить цену объявления (с 2FA через TG)',
             '/list — сводка по всем торговцам: цена / имя / доступно / лимиты',
+            '/cap 37 — потолок: выше не поднимаюсь (/cap off — снять, /cap — показать)',
             '/status — текущее состояние',
             '/cancel — отмена в момент ожидания 2FA',
             'В момент ожидания 2FA: 6 цифр — код, число вроде 37 — своя цена вместо предложенной',
@@ -1451,6 +1518,8 @@ function createPanel() {
         <input type="number" id="userPrice" step="0.001" placeholder="Ваша цена">
         <label>Предел (THB):</label>
         <input type="number" id="priceFloor" step="0.01" placeholder="ниже не опускаться">
+        <label>Потолок (THB):</label>
+        <input type="number" id="priceCeil" step="0.01" placeholder="выше не поднимать">
         <label>Игнорировать мерчантов:</label>
         <input type="text" id="ignoredMerchants" placeholder="User1,User2">
         <label>Имя мерчанта:</label>
@@ -1487,12 +1556,13 @@ function createPanel() {
         document.body.prepend(toggleButtonContainer);
 
         chrome.storage.local.get(
-            ['merchantName', 'userPrice', 'priceFloor', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
+            ['merchantName', 'userPrice', 'priceFloor', 'priceCeil', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
              'autonomousMode', 'notAtHome', 'telegramToken', 'telegramChatId'],
             (data) => {
                 if (data.merchantName) document.getElementById('merchantName').value = data.merchantName;
                 if (data.userPrice) document.getElementById('userPrice').value = data.userPrice;
                 if (typeof data.priceFloor === 'number') document.getElementById('priceFloor').value = data.priceFloor;
+                if (typeof data.priceCeil === 'number') document.getElementById('priceCeil').value = data.priceCeil;
                 if (data.ignoredMerchants) document.getElementById('ignoredMerchants').value = data.ignoredMerchants;
                 if (data.lastOrderNo) document.getElementById('newOrderNo').value = data.lastOrderNo;
                 const auto = !!data.autonomousMode;
@@ -1535,6 +1605,33 @@ function createPanel() {
             const v = parseFloat(raw);
             if (!isNaN(v) && v > 0) chrome.storage.local.set({ priceFloor: v });
         });
+        document.getElementById('priceCeil').addEventListener('input', () => {
+            const raw = document.getElementById('priceCeil').value.trim();
+            if (raw === '') {
+                chrome.storage.local.remove('priceCeil');
+                return;
+            }
+            const v = parseFloat(raw);
+            if (isNaN(v) || v <= 0) return;
+            chrome.storage.local.set({ priceCeil: v });
+            const floor = parseFloat(document.getElementById('priceFloor').value);
+            if (!isNaN(floor) && floor > 0 && v < floor) {
+                showMessage(`Потолок ${v} ниже предела ${floor} — потолок игнорируется.`);
+            }
+        });
+        // Потолок и цена меняются и удалённо (/cap из Telegram, успешное авто-обновление) —
+        // подтягиваем значения в поля, чтобы панель не показывала устаревшее.
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== 'local') return;
+            [['priceCeil', 'priceCeil'], ['priceFloor', 'priceFloor'], ['userPrice', 'userPrice']].forEach(([key, id]) => {
+                if (!changes[key]) return;
+                const el = document.getElementById(id);
+                if (!el || el === document.activeElement) return;
+                const v = changes[key].newValue;
+                el.value = (typeof v === 'number') ? v : '';
+            });
+        });
+
         document.getElementById('ignoredMerchants').addEventListener('input', () => {
             chrome.storage.local.set({ ignoredMerchants: document.getElementById('ignoredMerchants').value.trim() });
         });
@@ -1604,6 +1701,7 @@ function createPanel() {
             chrome.storage.local.clear(() => {
                 document.getElementById('userPrice').value = '';
                 document.getElementById('priceFloor').value = '';
+                document.getElementById('priceCeil').value = '';
                 document.getElementById('ignoredMerchants').value = '';
                 document.getElementById('merchantName').value = '';
                 document.getElementById('newPrice').value = '';
