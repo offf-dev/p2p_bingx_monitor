@@ -641,6 +641,22 @@ function floorSeparator(priceFloor, width) {
     return '─'.repeat(left) + label + '─'.repeat(right);
 }
 
+// Своя цена из сообщения TG: "37", "37,5", "/change 36.55", "/price 36.55".
+// Шесть цифр подряд сюда не попадают (это код 2FA): целая часть — максимум 4 знака.
+function parseTgPrice(rawText) {
+    const m = (rawText || '').trim().match(/^(?:\/?(?:change|price|цена)\s*)?(\d{1,4}(?:[.,]\d{1,4})?)$/i);
+    if (!m) return null;
+    const v = parseFloat(m[1].replace(',', '.'));
+    return (isNaN(v) || v <= 0) ? null : v;
+}
+
+// Перезапуск формы редактирования с новой целью (та же URL → reload).
+function navigateToEdit(orderNo) {
+    const url = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(orderNo)}`;
+    if (location.href === url) window.location.reload();
+    else window.location.href = url;
+}
+
 // Возвращает счётчики по каждому селектору, чтобы при поломке вёрстки было видно, что именно отвалилось.
 function checkSelectors() {
     const rows = document.querySelectorAll(SEL_ROWS);
@@ -807,6 +823,7 @@ function performCycle() {
                         if (mode === 'jumpAboveField' || mode === 'raiseToLeader') {
                             tgParts.push(formatMerchantsSummary(allRows, { userPrice, priceFloor }));
                         }
+                        tgParts.push(escapeHtml('Не согласен — пришли своё число (напр. 37) вместо кода 2FA, поставлю его.'));
                         triggerAutonomousEdit({
                             target,
                             refPrice,
@@ -889,6 +906,7 @@ async function runEditPageFlow(params) {
     autoFlowRunning = true;
 
     const { competitor, oldPrice } = params;
+    const orderNo = params.orderNo || getOrderNoFromUrl(location.href);
     let { target } = params;
 
     try {
@@ -955,12 +973,35 @@ async function runEditPageFlow(params) {
             if (competitor != null) lines.push(`Конкурент: ${competitor} THB`);
             if (oldPrice != null) lines.push(`Ваша: ${oldPrice} THB`);
             if (target != null) lines.push(`Новая: ${target} THB`);
-            lines.push('', 'Пришли 6 цифр 2FA (или /cancel).');
+            lines.push('', 'Пришли 6 цифр 2FA.');
+            lines.push('Своя цена вместо предложенной — просто число (напр. 37).');
+            lines.push('/cancel — отбой.');
             await tgSend(lines.join('\n'));
         }
 
         const outcome = await wait2FA(tgCfg, TWOFA_WAIT_TIMEOUT_MS);
-        if (outcome === 'cancel') {
+        if (outcome.type === 'retarget') {
+            // Пользователь прислал свою цену вместо кода — перезапускаем форму с новой целью.
+            if (!orderNo) throw new Error('Своя цена принята, но orderNo неизвестен — перезапуск невозможен.');
+            if (tgCfg.enabled) {
+                await tgSend(`🔁 Ставлю вашу цену ${outcome.price} THB вместо ${target}. Перезаполняю форму, жду 2FA.`).catch(() => {});
+            }
+            await setStorage({
+                autoUpdate: {
+                    state: 'goto_edit',
+                    target: outcome.price,
+                    orderNo,
+                    competitor,
+                    oldPrice,
+                    startedAt: Date.now()
+                }
+            });
+            updateAutoOverlayStatus(`Новая цель: ${outcome.price} THB. Перезапуск формы...`);
+            await sleep(500);
+            navigateToEdit(orderNo);
+            return;
+        }
+        if (outcome.type === 'cancel') {
             // Soft cancel — цена не сохранена, но возвращаемся на главную и продолжаем мониторинг.
             // Уведомление в TG уже отправлено из wait2FA одним сообщением.
             await setAutoState({ state: 'cooldown' });
@@ -969,7 +1010,7 @@ async function runEditPageFlow(params) {
             window.location.href = P2P_MAIN_URL;
             return;
         }
-        if (outcome === 'timeout') {
+        if (outcome.type === 'timeout') {
             // Soft recovery: вместо мёртвого аборта возвращаемся на главную, мониторинг + поллинг продолжатся.
             if (tgCfg.enabled) {
                 await tgSend('⏱ Таймаут 2FA. Возвращаюсь на главную, мониторинг продолжается. /change <цена> — ручная смена.').catch(() => {});
@@ -1007,8 +1048,9 @@ async function runEditPageFlow(params) {
 }
 
 // Ждём закрытия 2FA-модалки. Если конфиг Telegram включён — параллельно поллим Telegram:
-// на сообщение с 6 цифрами вставляем код в BingX и кликаем Submit.
-// Возвращает: 'done' | 'cancel' | 'timeout'.
+// на сообщение с 6 цифрами вставляем код в BingX и кликаем Submit; число вида 37 / 36.55
+// трактуем как «ставь мою цену».
+// Возвращает: {type:'done'|'cancel'|'timeout'} | {type:'retarget', price}.
 async function wait2FA(tgCfg, timeoutMs) {
     const start = Date.now();
     const MODAL_SEL = '.security-verify-entry';
@@ -1037,7 +1079,7 @@ async function wait2FA(tgCfg, timeoutMs) {
 
     while (Date.now() - start < timeoutMs) {
         // (a) модалка исчезла — пользователь ввёл код вручную (VNC и т.п.)
-        if (!document.querySelector(MODAL_SEL)) return 'done';
+        if (!document.querySelector(MODAL_SEL)) return { type: 'done' };
 
         if (tgCfg.enabled) {
             try {
@@ -1057,11 +1099,16 @@ async function wait2FA(tgCfg, timeoutMs) {
                     if (/^\/?cancel$/i.test(text)) {
                         await setStorage({ tgLastOffset: offset });
                         await tgSend('❌ Отменено, слежу дальше.');
-                        return 'cancel';
+                        return { type: 'cancel' };
                     }
                     const codeMatch = text.match(/^\d{6}$/);
                     if (!codeMatch) {
-                        await tgSend(`Нужно ровно 6 цифр или /cancel. Пришло: "${rawText}"`);
+                        const ownPrice = parseTgPrice(rawText);
+                        if (ownPrice !== null) {
+                            await setStorage({ tgLastOffset: offset });
+                            return { type: 'retarget', price: ownPrice };
+                        }
+                        await tgSend(`Нужно 6 цифр 2FA, своя цена (напр. 37) или /cancel. Пришло: "${rawText}"`);
                         continue;
                     }
                     // Вводим код в модалку
@@ -1074,13 +1121,13 @@ async function wait2FA(tgCfg, timeoutMs) {
                     } catch (e) {
                         await tgSend(`❌ Не удалось ввести код: ${e.message || e}`);
                         await setStorage({ tgLastOffset: offset });
-                        return 'cancel';
+                        return { type: 'cancel' };
                     }
                     // Проверяем, закрылась ли модалка
                     try {
                         await waitForSelectorGone(MODAL_SEL, 10000);
                         await setStorage({ tgLastOffset: offset });
-                        return 'done';
+                        return { type: 'done' };
                     } catch (e) {
                         await tgSend('Код не принят, пришли актуальный (6 цифр).');
                     }
@@ -1099,7 +1146,7 @@ async function wait2FA(tgCfg, timeoutMs) {
             await sleep(500);
         }
     }
-    return 'timeout';
+    return { type: 'timeout' };
 }
 
 // Recovery-поллер: запускается на edit-странице после ошибки/aborted. Поддерживает:
@@ -1136,8 +1183,9 @@ async function runTgRecoveryLoop(cfg) {
                 }
 
                 const changeMatch = rawText.match(/^\/?change\s+(\d+(?:[\.,]\d+)?)\s*$/i);
-                if (changeMatch) {
-                    const target = parseFloat(changeMatch[1].replace(',', '.'));
+                const bareTarget = changeMatch ? null : parseTgPrice(rawText);
+                if (changeMatch || bareTarget !== null) {
+                    const target = changeMatch ? parseFloat(changeMatch[1].replace(',', '.')) : bareTarget;
                     if (isNaN(target) || target <= 0) {
                         await tgSend('Цена не парсится. /change 36.55');
                         continue;
@@ -1181,7 +1229,7 @@ async function runTgRecoveryLoop(cfg) {
                     await tgSend([
                         'Я застрял на edit-странице. Команды:',
                         '/cancel — отбой, домой к мониторингу',
-                        '/change 36.55 — повторить с другой ценой',
+                        '/change 36.55 (или просто 36.55) — повторить с другой ценой',
                         '/status — детали'
                     ].join('\n'));
                     continue;
@@ -1265,10 +1313,11 @@ async function handleTgMainCommand(cfg, update) {
     const rawText = (msg.text || '').trim();
     if (!rawText) return false;
 
-    // /change <цена>
+    // /change <цена> или просто число
     const changeMatch = rawText.match(/^\/?change\s+(\d+(?:[\.,]\d+)?)\s*$/i);
-    if (changeMatch) {
-        const target = parseFloat(changeMatch[1].replace(',', '.'));
+    const bareTarget = changeMatch ? null : parseTgPrice(rawText);
+    if (changeMatch || bareTarget !== null) {
+        const target = changeMatch ? parseFloat(changeMatch[1].replace(',', '.')) : bareTarget;
         if (isNaN(target) || target <= 0) {
             await tgSend('Цена не парсится. Пример: /change 36.55');
             return false;
@@ -1329,10 +1378,11 @@ async function handleTgMainCommand(cfg, update) {
     if (/^\/?help$/i.test(rawText)) {
         await tgSend([
             'Команды:',
-            '/change 36.55 — изменить цену объявления (с 2FA через TG)',
+            '/change 36.55 (или просто 36.55) — изменить цену объявления (с 2FA через TG)',
             '/list — сводка по всем торговцам: цена / имя / доступно / лимиты',
             '/status — текущее состояние',
             '/cancel — отмена в момент ожидания 2FA',
+            'В момент ожидания 2FA: 6 цифр — код, число вроде 37 — своя цена вместо предложенной',
             '/help — это сообщение'
         ].join('\n'));
         return false;
