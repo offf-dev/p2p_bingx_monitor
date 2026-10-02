@@ -13,11 +13,21 @@ let tgMainPollCtx = null; // { aborted: bool }
 // ===== Constants =====
 const PRICE_BELOW_BEEP_INTERVAL_MS = 30000;
 const MIN_TICK = 0.005;
-const SANITY_MAX_PCT = 0.10;
+const SANITY_MAX_PCT = 0.20;
 const ELEMENT_TIMEOUT_MS = 15000;
 const MODAL_APPEAR_TIMEOUT_MS = 10000;
 const TWOFA_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
 const COOLDOWN_MS = 2000;
+
+// ===== Селекторы таблицы объявлений =====
+// BingX регулярно меняет утилитарные классы размера (line-heightNN / fontNN), поэтому в селекторы
+// берём только смысловые классы. Так в сентябре 2026 отвалилась цена:
+// `number line-height20 text1 weight-bolder font18` → `number line-height24 text1 weight-bolder font24`.
+const SEL_ROWS = '.p2p-adverts-table .row-item';
+const SEL_NAME = '.cursor-pointer.ellipsis.weight-bolder';
+const SEL_PRICE = '.number.text1.weight-bolder';
+const SEL_LIMIT = '.flex.column-direction.text1.number > span:first-child';
+const PRICE_TEXT_RE = /^[\d,]+(?:\.\d+)?\s*THB$/;
 
 const P2P_MAIN_URL = 'https://fiat.bingx.com/ru-ru/p2p';
 const EDIT_URL_BASE = 'https://fiat.bingx.com/ru-ru/p2p/advert/edit';
@@ -370,16 +380,18 @@ async function onCancelAutoUpdate() {
 }
 
 // ===== Alert sub-panel (on main page when beaten) =====
-function showAlertPanel(minCompetitorPrice, minCompetitorStr) {
+// suggestedTarget: предложенная цена; label: текст-заголовок над панелью; null = не подставлять.
+function showAlertPanel({ suggestedTarget, label }) {
     if (alertPanelDismissed) return;
     const el = document.getElementById('alertSubPanel');
     if (!el) return;
+    if (label) {
+        const labelEl = el.querySelector('.alert-label');
+        if (labelEl) labelEl.textContent = label;
+    }
     if (!alertPanelShown) {
-        const suggested = minCompetitorStr
-            ? computeSuggestedPrice(minCompetitorStr)
-            : Number((minCompetitorPrice - MIN_TICK).toFixed(3));
         const newPriceEl = document.getElementById('newPrice');
-        if (newPriceEl && !newPriceEl.value && suggested !== null) newPriceEl.value = suggested;
+        if (newPriceEl && !newPriceEl.value && suggestedTarget != null) newPriceEl.value = suggestedTarget;
         chrome.storage.local.get(['lastOrderNo'], (data) => {
             const noEl = document.getElementById('newOrderNo');
             if (noEl && !noEl.value && data.lastOrderNo) noEl.value = data.lastOrderNo;
@@ -433,11 +445,12 @@ async function onApplyPriceChange() {
     window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(orderNo)}`;
 }
 
-async function triggerAutonomousEdit(minPrice, minPriceStr, oldPrice, orderNo) {
+// Универсальный триггер авто-редактирования. target — итоговая цена; refPrice — конкурент-якорь
+// (для записи в state и сообщений); shortMsg/tgMsg — описание причины.
+async function triggerAutonomousEdit({ target, refPrice, oldPrice, orderNo, shortMsg, tgMsg }) {
     const { autoUpdate } = await getStorage(['autoUpdate']);
     if (autoUpdate && autoUpdate.state && autoUpdate.state !== 'idle') return;
 
-    const target = minPriceStr ? computeSuggestedPrice(minPriceStr) : null;
     if (target === null || isNaN(target) || target <= 0) {
         showMessage('Автоном: не удалось вычислить новую цену.');
         return;
@@ -449,28 +462,83 @@ async function triggerAutonomousEdit(minPrice, minPriceStr, oldPrice, orderNo) {
             state: 'goto_edit',
             target,
             orderNo,
-            competitor: minPrice,
+            competitor: refPrice,
             oldPrice,
             startedAt: Date.now()
         }
     });
-    showMessage(`Автоном: ${oldPrice} → ${target} (конкурент ${minPrice}). Переход...`);
-    tgSend(`⚠ Перебили. Конкурент: ${minPrice} THB. Ваша: ${oldPrice} THB. Меняю на ${target} THB.`).catch(() => {});
+    showMessage(shortMsg || `Автоном: ${oldPrice} → ${target}. Переход...`);
+    if (tgMsg) tgSend(tgMsg).catch(() => {});
     await sleep(300);
     window.location.href = `${EDIT_URL_BASE}?orderNo=${encodeURIComponent(orderNo)}`;
 }
 
 // ===== Core monitoring =====
+// Цена: сначала по классам, затем фолбэк по формату текста ("36.25 THB" одним узлом без детей).
+// Диапазон лимита ("500.00 THB - 7,250.00 THB") под регулярку не подходит и не перехватывается.
+function findPriceEl(row) {
+    const byClass = row.querySelector(SEL_PRICE);
+    if (byClass) return byClass;
+    return Array.from(row.querySelectorAll('td div, td span'))
+        .find(el => !el.children.length && PRICE_TEXT_RE.test(el.textContent.trim())) || null;
+}
+
+// Возвращает счётчики по каждому селектору, чтобы при поломке вёрстки было видно, что именно отвалилось.
 function checkSelectors() {
-    const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
-    const priceElements = document.querySelectorAll('.number.line-height20.text1.weight-bolder.font18');
-    const limitElements = document.querySelectorAll('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
-    return rows.length > 0 && priceElements.length > 0 && limitElements.length > 0;
+    const rows = document.querySelectorAll(SEL_ROWS);
+    let price = 0, limit = 0, name = 0;
+    rows.forEach((row) => {
+        if (findPriceEl(row)) price++;
+        if (row.querySelector(SEL_LIMIT)) limit++;
+        if (row.querySelector(SEL_NAME)) name++;
+    });
+    return { ok: rows.length > 0 && price > 0 && limit > 0, counts: { rows: rows.length, price, limit, name } };
+}
+
+// Описания режимов для UI/TG: undercut / jumpAboveField / raiseToLeader / loneAboveFloor.
+function describeShortMsg(mode, refPrice, oldPrice, target) {
+    switch (mode) {
+        case 'undercut':
+            return refPrice < oldPrice
+                ? `Перебили: ${refPrice} < ${oldPrice}. → ${target}.`
+                : `Сравнялись с ${refPrice}. → ${target}.`;
+        case 'jumpAboveField':
+            return `Лидер на пределе. Прыгаю под ${refPrice} → ${target}.`;
+        case 'raiseToLeader':
+            return `Один в лидерах. Поднимаю под ${refPrice} → ${target}.`;
+    }
+    return `${oldPrice} → ${target}`;
+}
+
+function describeTgMsg(mode, refPrice, oldPrice, target) {
+    switch (mode) {
+        case 'undercut': {
+            const verb = refPrice < oldPrice ? 'Перебили' : 'Сравнялись';
+            return `⚠ ${verb}. Конкурент: ${refPrice} THB. Ваша: ${oldPrice} THB. Меняю на ${target} THB.`;
+        }
+        case 'jumpAboveField':
+            return `⤴ Лидер просел до предела. Прыгаю наверх под ${refPrice} THB. Ваша: ${oldPrice} → ${target} THB.`;
+        case 'raiseToLeader':
+            return `⤴ Один в лидерах с зазором. Поднимаюсь под ${refPrice} THB. Ваша: ${oldPrice} → ${target} THB.`;
+    }
+    return '';
+}
+
+function describeAlertLabel(mode, refPrice) {
+    switch (mode) {
+        case 'undercut':
+            return `Цену перебили (${refPrice}) — изменить:`;
+        case 'jumpAboveField':
+            return `Лидер на пределе (${refPrice}) — прыжок наверх:`;
+        case 'raiseToLeader':
+            return `Один в лидерах — поднять под ${refPrice}:`;
+    }
+    return 'Изменить цену:';
 }
 
 function performCycle() {
     chrome.storage.local.get(
-        ['userPrice', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit', 'autonomousMode', 'lastOrderNo'],
+        ['userPrice', 'priceFloor', 'merchantName', 'ignoredMerchants', 'isMonitoring', 'previousLimit', 'autonomousMode', 'lastOrderNo'],
         (data) => {
             if (!data.isMonitoring) {
                 stopMonitoring();
@@ -478,69 +546,136 @@ function performCycle() {
             }
 
             const userPrice = data.userPrice;
+            const priceFloor = (typeof data.priceFloor === 'number' && data.priceFloor > 0) ? data.priceFloor : null;
             const merchantName = data.merchantName;
             const ignoredMerchants = data.ignoredMerchants
                 ? data.ignoredMerchants.split(',').map(n => removeEmojis(n.trim())).filter(Boolean)
                 : [];
 
             try {
-                const rows = document.querySelectorAll('.p2p-adverts-table .row-item');
-                let minPrice = Infinity;
-                let minPriceStr = null;
+                const rows = document.querySelectorAll(SEL_ROWS);
+                const cleanInputName = merchantName ? removeEmojis(merchantName) : '';
+                const competitors = []; // {price, priceStr} в порядке появления, ниже отсортируем
                 let foundOwnRow = false;
                 let currentLimit = null;
 
                 rows.forEach((row) => {
-                    const nameEl = row.querySelector('.cursor-pointer.ellipsis.weight-bolder');
-                    const priceEl = row.querySelector('.number.line-height20.text1.weight-bolder.font18');
-                    const limitEl = row.querySelector('.flex.column-direction.text1.number.gap4.line-height22 > span:first-child');
+                    const nameEl = row.querySelector(SEL_NAME);
+                    const priceEl = findPriceEl(row);
+                    const limitEl = row.querySelector(SEL_LIMIT);
 
-                    if (priceEl && userPrice) {
-                        const cleanName = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
-                        if (!ignoredMerchants.includes(cleanName)) {
-                            const priceText = priceEl.textContent.replace(' THB', '').replace(/,/g, '').trim();
-                            const price = parseFloat(priceText);
-                            if (!isNaN(price) && price < minPrice) {
-                                minPrice = price;
-                                minPriceStr = priceText;
-                            }
-                        }
+                    const cleanName = nameEl ? removeEmojis(nameEl.textContent.trim()) : '';
+                    const isOwnRow = !!cleanInputName && cleanName.includes(cleanInputName);
+
+                    if (priceEl && !isOwnRow && !ignoredMerchants.includes(cleanName)) {
+                        const priceStr = priceEl.textContent.replace(' THB', '').replace(/,/g, '').trim();
+                        const price = parseFloat(priceStr);
+                        if (!isNaN(price)) competitors.push({ price, priceStr });
                     }
 
-                    if (nameEl && limitEl && merchantName) {
-                        const cleanName = removeEmojis(nameEl.textContent.trim());
-                        const cleanInputName = removeEmojis(merchantName);
-                        if (cleanName.includes(cleanInputName)) {
-                            foundOwnRow = true;
-                            const limitText = limitEl.textContent.replace(' USDT', '').replace(/,/g, '').trim();
-                            const parsed = parseFloat(limitText);
-                            if (!isNaN(parsed)) currentLimit = parsed;
-                        }
+                    if (isOwnRow && limitEl) {
+                        foundOwnRow = true;
+                        const limitText = limitEl.textContent.replace(' USDT', '').replace(/,/g, '').trim();
+                        const parsed = parseFloat(limitText);
+                        if (!isNaN(parsed)) currentLimit = parsed;
                     }
                 });
 
-                if (userPrice && minPrice < userPrice) {
+                competitors.sort((a, b) => a.price - b.price);
+                const leader = competitors[0] || null;
+
+                // ===== Decision =====
+                let mode = null;
+                let target = null;
+                let refPrice = null;
+
+                if (userPrice && leader) {
+                    if (priceFloor && leader.price <= priceFloor) {
+                        // Лидер просел до/ниже предела — паркуемся под наименьшим конкурентом > предела.
+                        const aboveFloor = competitors.find(c => c.price > priceFloor);
+                        if (aboveFloor) {
+                            const candidate = computeSuggestedPrice(aboveFloor.priceStr);
+                            if (candidate !== null && candidate >= priceFloor
+                                && Math.abs(candidate - userPrice) > 1e-6) {
+                                mode = 'jumpAboveField';
+                                target = candidate;
+                                refPrice = aboveFloor.price;
+                            }
+                        } else {
+                            // Над пределом никого — без авто-действия, только сигнал.
+                            mode = 'loneAboveFloor';
+                            refPrice = leader.price;
+                        }
+                    } else {
+                        // c1 > предела (или предел не задан).
+                        const candidate = computeSuggestedPrice(leader.priceStr);
+                        if (candidate !== null && candidate > 0) {
+                            if (priceFloor) {
+                                // С пределом работаем в обе стороны: undercut и raise.
+                                if (Math.abs(candidate - userPrice) > 1e-6) {
+                                    mode = candidate < userPrice ? 'undercut' : 'raiseToLeader';
+                                    target = candidate;
+                                    refPrice = leader.price;
+                                }
+                            } else {
+                                // Без предела — legacy: только undercut, raise отключён.
+                                // Свой ряд исключён, поэтому при known merchantName допустимо равенство.
+                                const beaten = cleanInputName
+                                    ? leader.price <= userPrice
+                                    : leader.price < userPrice;
+                                if (beaten && Math.abs(candidate - userPrice) > 1e-6) {
+                                    mode = 'undercut';
+                                    target = candidate;
+                                    refPrice = leader.price;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ===== Reaction =====
+                if (mode === 'loneAboveFloor') {
                     const now = Date.now();
-                    const priceChanged = lastBeepedMinPrice !== minPrice;
+                    const refChanged = lastBeepedMinPrice !== refPrice;
                     const timeToRemind = now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS;
-                    if (priceChanged || timeToRemind) {
+                    if (refChanged || timeToRemind) {
                         playBeep();
-                        showMessage(`Найдена цена ниже вашей: ${minPrice} THB!`);
-                        lastBeepedMinPrice = minPrice;
+                        showMessage(`Лидер на пределе (${refPrice}), выше никого. Введи цену вручную.`);
+                        lastBeepedMinPrice = refPrice;
+                        lastPriceBelowBeepAt = now;
+                        if (data.autonomousMode) {
+                            tgSend(`⚠ Лидер на пределе ${refPrice} THB, других конкурентов выше нет. Реши: /change <цена>.`).catch(() => {});
+                        }
+                    }
+                    showAlertPanel({ suggestedTarget: null, label: `Лидер на пределе (${refPrice}). Введи цену вручную:` });
+                } else if (mode) {
+                    const now = Date.now();
+                    const refChanged = lastBeepedMinPrice !== refPrice;
+                    const timeToRemind = now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS;
+                    if (refChanged || timeToRemind) {
+                        playBeep();
+                        showMessage(describeShortMsg(mode, refPrice, userPrice, target));
+                        lastBeepedMinPrice = refPrice;
                         lastPriceBelowBeepAt = now;
                     }
 
                     if (data.autonomousMode && data.lastOrderNo) {
-                        triggerAutonomousEdit(minPrice, minPriceStr, userPrice, data.lastOrderNo)
-                            .catch(err => {
-                                console.error('Autonomous trigger:', err);
-                                showAlertPanel(minPrice, minPriceStr);
-                            });
+                        triggerAutonomousEdit({
+                            target,
+                            refPrice,
+                            oldPrice: userPrice,
+                            orderNo: data.lastOrderNo,
+                            shortMsg: describeShortMsg(mode, refPrice, userPrice, target) + ' Переход...',
+                            tgMsg: describeTgMsg(mode, refPrice, userPrice, target)
+                        }).catch(err => {
+                            console.error('Autonomous trigger:', err);
+                            showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) });
+                        });
                     } else {
                         if (data.autonomousMode && !data.lastOrderNo) {
                             showMessage('Автоном: orderNo не захвачен. Открой edit вручную один раз.');
                         }
-                        showAlertPanel(minPrice, minPriceStr);
+                        showAlertPanel({ suggestedTarget: target, label: describeAlertLabel(mode, refPrice) });
                     }
                 } else {
                     lastBeepedMinPrice = null;
@@ -628,7 +763,7 @@ async function runEditPageFlow(params) {
         if (!isNaN(currentValue) && currentValue > 0) {
             const diffPct = Math.abs(target - currentValue) / currentValue;
             if (diffPct > SANITY_MAX_PCT) {
-                throw new Error(`Санитарный диапазон: ${currentValue} → ${target} = ${(diffPct * 100).toFixed(1)}% (>10%). Отмена.`);
+                throw new Error(`Санитарный диапазон: ${currentValue} → ${target} = ${(diffPct * 100).toFixed(1)}% (>${(SANITY_MAX_PCT * 100).toFixed(0)}%). Отмена.`);
             }
         }
 
@@ -1100,6 +1235,8 @@ function createPanel() {
       <div class="row">
         <label>Цена (THB):</label>
         <input type="number" id="userPrice" step="0.001" placeholder="Ваша цена">
+        <label>Предел (THB):</label>
+        <input type="number" id="priceFloor" step="0.01" placeholder="ниже не опускаться">
         <label>Игнорировать мерчантов:</label>
         <input type="text" id="ignoredMerchants" placeholder="User1,User2">
         <label>Имя мерчанта:</label>
@@ -1136,11 +1273,12 @@ function createPanel() {
         document.body.prepend(toggleButtonContainer);
 
         chrome.storage.local.get(
-            ['merchantName', 'userPrice', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
+            ['merchantName', 'userPrice', 'priceFloor', 'ignoredMerchants', 'isPanelCollapsed', 'isMonitoring', 'lastOrderNo',
              'autonomousMode', 'notAtHome', 'telegramToken', 'telegramChatId'],
             (data) => {
                 if (data.merchantName) document.getElementById('merchantName').value = data.merchantName;
                 if (data.userPrice) document.getElementById('userPrice').value = data.userPrice;
+                if (typeof data.priceFloor === 'number') document.getElementById('priceFloor').value = data.priceFloor;
                 if (data.ignoredMerchants) document.getElementById('ignoredMerchants').value = data.ignoredMerchants;
                 if (data.lastOrderNo) document.getElementById('newOrderNo').value = data.lastOrderNo;
                 const auto = !!data.autonomousMode;
@@ -1173,6 +1311,15 @@ function createPanel() {
         document.getElementById('userPrice').addEventListener('input', () => {
             const v = parseFloat(document.getElementById('userPrice').value);
             if (!isNaN(v) && v > 0) chrome.storage.local.set({ userPrice: v });
+        });
+        document.getElementById('priceFloor').addEventListener('input', () => {
+            const raw = document.getElementById('priceFloor').value.trim();
+            if (raw === '') {
+                chrome.storage.local.remove('priceFloor');
+                return;
+            }
+            const v = parseFloat(raw);
+            if (!isNaN(v) && v > 0) chrome.storage.local.set({ priceFloor: v });
         });
         document.getElementById('ignoredMerchants').addEventListener('input', () => {
             chrome.storage.local.set({ ignoredMerchants: document.getElementById('ignoredMerchants').value.trim() });
@@ -1232,15 +1379,17 @@ function createPanel() {
         });
 
         document.getElementById('checkSelectors').addEventListener('click', () => {
-            const ok = checkSelectors();
-            document.getElementById('status').textContent = ok ? 'Селекторы найдены!' : '';
-            document.getElementById('error').textContent = ok ? '' : 'Селекторы не найдены!';
+            const { ok, counts } = checkSelectors();
+            const detail = `строки: ${counts.rows}, цены: ${counts.price}, лимиты: ${counts.limit}, имена: ${counts.name}`;
+            document.getElementById('status').textContent = ok ? `Селекторы найдены (${detail})` : '';
+            document.getElementById('error').textContent = ok ? '' : `Селекторы не найдены — ${detail}`;
         });
 
         document.getElementById('resetStorage').addEventListener('click', () => {
             stopMonitoring();
             chrome.storage.local.clear(() => {
                 document.getElementById('userPrice').value = '';
+                document.getElementById('priceFloor').value = '';
                 document.getElementById('ignoredMerchants').value = '';
                 document.getElementById('merchantName').value = '';
                 document.getElementById('newPrice').value = '';
