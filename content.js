@@ -68,6 +68,45 @@ async function resetAutoState() {
     await setStorage({ autoUpdate: { state: 'idle' } });
 }
 
+// Цена из storage: принимаем и число, и строку («36,69» из поля панели тоже).
+// Раньше строка молча считалась «не задано» — потолок переставал существовать.
+function asPrice(value) {
+    const n = typeof value === 'number' ? value : parseFloat(String(value ?? '').replace(',', '.'));
+    return (!isNaN(n) && n > 0) ? n : null;
+}
+
+const PRICE_FIELD_LABELS = { userPrice: 'Цена', priceFloor: 'Предел', priceCeil: 'Потолок' };
+
+// <input type="number"> на нераспознанном вводе (например, «36,69», если Chrome в этой локали
+// запятую не принимает) отдаёт пустую строку. Раньше это молча стирало значение из storage:
+// в поле цифры видны, а защиты нет — и бот уезжал под конкурента на 42 при потолке 36.69.
+// Поэтому «пусто» и «не разобрал» теперь разные случаи.
+function readPriceInput(id) {
+    const el = document.getElementById(id);
+    if (!el) return { value: null, state: 'missing' };
+    if (el.validity && el.validity.badInput) return { value: null, state: 'invalid' };
+    const raw = (el.value || '').trim();
+    if (raw === '') return { value: null, state: 'empty' };
+    const v = asPrice(raw);
+    return v === null ? { value: null, state: 'invalid' } : { value: v, state: 'ok' };
+}
+
+// Пишет значение поля в storage. Пусто — убираем ключ, мусор — оставляем прежнее и предупреждаем.
+function bindPriceInput(id) {
+    const { value, state } = readPriceInput(id);
+    const label = PRICE_FIELD_LABELS[id] || id;
+    if (state === 'empty') {
+        chrome.storage.local.remove(id);
+        return null;
+    }
+    if (state !== 'ok') {
+        showMessage(`${label}: не разобрал значение — нужно число через точку, напр. 36.69. Прежнее сохранено.`);
+        return null;
+    }
+    chrome.storage.local.set({ [id]: value });
+    return value;
+}
+
 function getOrderNoFromUrl(url) {
     try {
         return new URL(url).searchParams.get('orderNo');
@@ -742,11 +781,13 @@ function performCycle() {
                 return;
             }
 
-            const userPrice = data.userPrice;
-            const priceFloor = (typeof data.priceFloor === 'number' && data.priceFloor > 0) ? data.priceFloor : null;
-            const priceCeilRaw = (typeof data.priceCeil === 'number' && data.priceCeil > 0) ? data.priceCeil : null;
-            // Потолок ниже предела — бессмысленная пара, игнорируем потолок (в панели это подсвечено).
-            const priceCeil = (priceCeilRaw && priceFloor && priceCeilRaw < priceFloor) ? null : priceCeilRaw;
+            const userPrice = asPrice(data.userPrice);
+            const priceFloor = asPrice(data.priceFloor);
+            const priceCeilRaw = asPrice(data.priceCeil);
+            // Потолок ниже предела — пара невыполнима. Молча игнорировать потолок нельзя:
+            // именно так бот и уезжал под конкурента на 42 при потолке 36.69.
+            const ceilBelowFloor = !!(priceCeilRaw && priceFloor && priceCeilRaw < priceFloor);
+            const priceCeil = ceilBelowFloor ? null : priceCeilRaw;
             const merchantName = data.merchantName;
             const ignoredMerchants = data.ignoredMerchants
                 ? data.ignoredMerchants.split(',').map(n => removeEmojis(n.trim())).filter(Boolean)
@@ -829,7 +870,23 @@ function performCycle() {
                 const capNote = capped ? ` (потолок ${priceCeil})` : '';
 
                 // ===== Reaction =====
-                if (mode === 'loneAboveFloor') {
+                if (ceilBelowFloor && mode) {
+                    // Любое авто-действие здесь — лотерея: потолок просит одно, предел другое.
+                    const now = Date.now();
+                    const warning = `Потолок ${priceCeilRaw} ниже предела ${priceFloor} — авто-смена остановлена.`;
+                    if (lastBeepedMinPrice !== refPrice || now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS) {
+                        playBeep();
+                        showMessage(warning + ' Поправь значения в панели.');
+                        lastBeepedMinPrice = refPrice;
+                        lastPriceBelowBeepAt = now;
+                        if (data.autonomousMode) {
+                            tgSend(`⚠ ${warning}\nПоправь: /cap <цена выше предела> или /cap off.`).catch(() => {});
+                        }
+                    }
+                    const statusEl = document.getElementById('status');
+                    if (statusEl) statusEl.textContent = `⚠ ${warning}`;
+                    showAlertPanel({ suggestedTarget: null, label: `${warning} Цена вручную:` });
+                } else if (mode === 'loneAboveFloor') {
                     const now = Date.now();
                     const refChanged = lastBeepedMinPrice !== refPrice;
                     const timeToRemind = now - lastPriceBelowBeepAt >= PRICE_BELOW_BEEP_INTERVAL_MS;
@@ -1744,26 +1801,13 @@ function createPanel() {
             if (!isNaN(v) && v > 0) chrome.storage.local.set({ userPrice: v });
         });
         document.getElementById('priceFloor').addEventListener('input', () => {
-            const raw = document.getElementById('priceFloor').value.trim();
-            if (raw === '') {
-                chrome.storage.local.remove('priceFloor');
-                return;
-            }
-            const v = parseFloat(raw);
-            if (!isNaN(v) && v > 0) chrome.storage.local.set({ priceFloor: v });
+            bindPriceInput('priceFloor');
         });
         document.getElementById('priceCeil').addEventListener('input', () => {
-            const raw = document.getElementById('priceCeil').value.trim();
-            if (raw === '') {
-                chrome.storage.local.remove('priceCeil');
-                return;
-            }
-            const v = parseFloat(raw);
-            if (isNaN(v) || v <= 0) return;
-            chrome.storage.local.set({ priceCeil: v });
-            const floor = parseFloat(document.getElementById('priceFloor').value);
-            if (!isNaN(floor) && floor > 0 && v < floor) {
-                showMessage(`Потолок ${v} ниже предела ${floor} — потолок игнорируется.`);
+            const v = bindPriceInput('priceCeil');
+            const floor = readPriceInput('priceFloor').value;
+            if (v !== null && floor !== null && v < floor) {
+                showMessage(`Потолок ${v} ниже предела ${floor} — пара невыполнима, авто-смена встанет.`);
             }
         });
         // Потолок и цена меняются и удалённо (/cap из Telegram, успешное авто-обновление) —
