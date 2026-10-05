@@ -703,10 +703,10 @@ function levelSeparator(text, width) {
     return '─'.repeat(left) + label + '─'.repeat(right);
 }
 
-// Своя цена из сообщения TG: "37", "37,5", "/change 36.55", "/price 36.55".
+// Своя цена из сообщения TG: "37", "37,5", "/change 36.55", "/price 36.55" (запятая в числе ок).
 // Шесть цифр подряд сюда не попадают (это код 2FA): целая часть — максимум 4 знака.
 function parseTgPrice(rawText) {
-    const m = (rawText || '').trim().match(/^(?:\/?(?:change|price|цена)\s*)?(\d{1,4}(?:[.,]\d{1,4})?)$/i);
+    const m = (rawText || '').trim().match(/^(?:\/?(?:change|price)\s*)?(\d{1,4}(?:[.,]\d{1,4})?)$/i);
     if (!m) return null;
     const v = parseFloat(m[1].replace(',', '.'));
     return (isNaN(v) || v <= 0) ? null : v;
@@ -1584,8 +1584,8 @@ async function handleTgMainCommand(cfg, update) {
         return true;
     }
 
-    // /stop — пауза цикла цен (поллер продолжает слушать), /start — возобновить
-    if (/^\/?(stop|pause|стоп|пауза)$/i.test(rawText)) {
+    // /stop (/pause) — пауза цикла цен, поллер продолжает слушать; /start (/resume) — вернуть
+    if (/^\/?(stop|pause)$/i.test(rawText)) {
         const { isMonitoring } = await getStorage(['isMonitoring']);
         if (!isMonitoring && !monitoringIntervalId) {
             await tgSend('Мониторинг и так выключен. /start — включить.');
@@ -1598,7 +1598,7 @@ async function handleTgMainCommand(cfg, update) {
         return false;
     }
 
-    if (/^\/?(start|старт)$/i.test(rawText)) {
+    if (/^\/?(start|resume)$/i.test(rawText)) {
         const d = await getStorage(['isMonitoring', 'userPrice', 'merchantName', 'priceFloor', 'priceCeil']);
         if (d.isMonitoring && monitoringIntervalId) {
             await tgSend('Мониторинг уже идёт. /status — детали.');
@@ -1619,7 +1619,7 @@ async function handleTgMainCommand(cfg, update) {
     }
 
     // /cap 37 — потолок продажи, /cap off — снять, /cap — показать текущий
-    const capMatch = rawText.match(/^\/?(?:cap|потолок)(?:\s+(.+))?$/i);
+    const capMatch = rawText.match(/^\/?cap(?:\s+(.+))?$/i);
     if (capMatch) {
         const arg = (capMatch[1] || '').trim();
         const d = await getStorage(['priceCeil', 'priceFloor']);
@@ -1629,7 +1629,7 @@ async function handleTgMainCommand(cfg, update) {
                 : 'Потолок не задан. Поставить — /cap 37');
             return false;
         }
-        if (/^(off|нет|снять|-|0)$/i.test(arg)) {
+        if (/^(off|none|-|0)$/i.test(arg)) {
             await new Promise(resolve => chrome.storage.local.remove('priceCeil', resolve));
             await tgSend('Потолок снят — поднимаюсь под ближайшего конкурента.');
             return false;
@@ -1649,7 +1649,7 @@ async function handleTgMainCommand(cfg, update) {
     }
 
     // /list — сводка по всем торговцам прямо сейчас
-    if (/^\/?(list|стакан)$/i.test(rawText)) {
+    if (/^\/?list$/i.test(rawText)) {
         const d = await getStorage(['merchantName', 'ignoredMerchants', 'userPrice', 'priceFloor', 'priceCeil']);
         const cleanInputName = d.merchantName ? removeEmojis(d.merchantName) : '';
         const ignored = d.ignoredMerchants
@@ -1664,7 +1664,7 @@ async function handleTgMainCommand(cfg, update) {
     }
 
     // /status
-    if (/^\/?(status|статус)$/i.test(rawText)) {
+    if (/^\/?status$/i.test(rawText)) {
         const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome', 'priceFloor', 'priceCeil', 'autoTotp', 'totpSecret']);
         const lines = [
             `Мониторинг: ${d.isMonitoring ? 'вкл' : 'выкл'}`,
