@@ -990,13 +990,15 @@ function startMonitoring() {
     startTgMainPoll().catch(e => console.error('TG main poll start:', e));
 }
 
+// Останавливает только цикл цен. Телеграм-поллер продолжает слушать: иначе /stop
+// оглушил бы бота и вернуть мониторинг командой было бы некому.
+// Поллер гасится явно там, где он больше не нужен: сброс, выключение автонома / «не на месте».
 function stopMonitoring() {
     if (monitoringIntervalId) {
         clearInterval(monitoringIntervalId);
         monitoringIntervalId = null;
     }
     hideAlertPanel();
-    stopTgMainPoll();
 }
 
 // ===== TOTP (авто-2FA) =====
@@ -1500,6 +1502,16 @@ async function startTgMainPoll() {
         if (stale.length) {
             offset = stale[stale.length - 1].update_id + 1;
             await setStorage({ tgLastOffset: offset });
+            // Выполнять задним числом нельзя (прилетит /change годичной давности), но и молча
+            // глотать нельзя: /stop, посланный пока бот уходил на edit, просто исчезал.
+            const missed = stale
+                .map(u => u.message)
+                .filter(msg => msg && msg.chat && String(msg.chat.id) === String(cfg.chatId) && (msg.text || '').trim())
+                .map(msg => msg.text.trim())
+                .slice(-5);
+            if (missed.length) {
+                await tgSend(`ℹ Пока я был занят, пришло: ${missed.map(t => `«${t}»`).join(', ')}. Задним числом не выполняю — повтори, если ещё актуально.`).catch(() => {});
+            }
         }
     } catch (e) {
         console.error('TG main stale drain:', e);
@@ -1572,6 +1584,40 @@ async function handleTgMainCommand(cfg, update) {
         return true;
     }
 
+    // /stop — пауза цикла цен (поллер продолжает слушать), /start — возобновить
+    if (/^\/?(stop|pause|стоп|пауза)$/i.test(rawText)) {
+        const { isMonitoring } = await getStorage(['isMonitoring']);
+        if (!isMonitoring && !monitoringIntervalId) {
+            await tgSend('Мониторинг и так выключен. /start — включить.');
+            return false;
+        }
+        await setStorage({ isMonitoring: false, previousLimit: null });
+        stopMonitoring();
+        await tgSend('⏸ Мониторинг остановлен — цену больше не трогаю и не слежу за стаканом.\n'
+            + 'Команды работают: /start, /change, /list, /cap, /status.');
+        return false;
+    }
+
+    if (/^\/?(start|старт)$/i.test(rawText)) {
+        const d = await getStorage(['isMonitoring', 'userPrice', 'merchantName', 'priceFloor', 'priceCeil']);
+        if (d.isMonitoring && monitoringIntervalId) {
+            await tgSend('Мониторинг уже идёт. /status — детали.');
+            return false;
+        }
+        if (!asPrice(d.userPrice) && !d.merchantName) {
+            await tgSend('Нечего мониторить: не заданы ни цена, ни имя мерчанта. Это только из панели.');
+            return false;
+        }
+        await setStorage({ isMonitoring: true });
+        startMonitoring();
+        await tgSend([
+            '▶️ Мониторинг запущен.',
+            `Ваша цена: ${d.userPrice ?? '—'} THB`,
+            `Предел: ${d.priceFloor ?? '—'} THB, потолок: ${d.priceCeil ?? '—'} THB`
+        ].join('\n'));
+        return false;
+    }
+
     // /cap 37 — потолок продажи, /cap off — снять, /cap — показать текущий
     const capMatch = rawText.match(/^\/?(?:cap|потолок)(?:\s+(.+))?$/i);
     if (capMatch) {
@@ -1618,7 +1664,7 @@ async function handleTgMainCommand(cfg, update) {
     }
 
     // /status
-    if (/^\/?status$/i.test(rawText)) {
+    if (/^\/?(status|статус)$/i.test(rawText)) {
         const d = await getStorage(['userPrice', 'isMonitoring', 'lastOrderNo', 'autonomousMode', 'notAtHome', 'priceFloor', 'priceCeil', 'autoTotp', 'totpSecret']);
         const lines = [
             `Мониторинг: ${d.isMonitoring ? 'вкл' : 'выкл'}`,
@@ -1638,6 +1684,7 @@ async function handleTgMainCommand(cfg, update) {
     if (/^\/?help$/i.test(rawText)) {
         await tgSend([
             'Команды:',
+            '/stop — поставить мониторинг на паузу, /start — снять с паузы',
             '/change 36.55 (или просто 36.55) — изменить цену объявления (с 2FA через TG)',
             '/list — сводка по всем торговцам: цена / имя / доступно / лимиты',
             '/cap 37 — потолок: выше не поднимаюсь (/cap off — снять, /cap — показать)',
@@ -1790,6 +1837,8 @@ function createPanel() {
                     document.getElementById('status').textContent = 'Мониторинг запущен...';
                     if (!monitoringIntervalId) startMonitoring();
                 }
+                // Слушаем команды, даже когда мониторинг выключен — иначе /start некому принять.
+                startTgMainPoll().catch(e => console.error('TG main poll start:', e));
             }
         );
 
@@ -1821,6 +1870,15 @@ function createPanel() {
                 const v = changes[key].newValue;
                 el.value = (typeof v === 'number') ? v : '';
             });
+            if (changes.isMonitoring) {
+                const on = !!changes.isMonitoring.newValue;
+                const startBtn = document.getElementById('startMonitoring');
+                const stopBtn = document.getElementById('stopMonitoring');
+                const statusEl = document.getElementById('status');
+                if (startBtn) startBtn.disabled = on;
+                if (stopBtn) stopBtn.disabled = !on;
+                if (statusEl) statusEl.textContent = on ? 'Мониторинг запущен...' : 'Мониторинг остановлен.';
+            }
         });
 
         document.getElementById('ignoredMerchants').addEventListener('input', () => {
@@ -1921,6 +1979,7 @@ function createPanel() {
 
         document.getElementById('resetStorage').addEventListener('click', () => {
             stopMonitoring();
+            stopTgMainPoll();
             chrome.storage.local.clear(() => {
                 document.getElementById('userPrice').value = '';
                 document.getElementById('priceFloor').value = '';
